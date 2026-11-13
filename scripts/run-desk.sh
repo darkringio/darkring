@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start the devnet desk service on 127.0.0.1:5374 (DESK_PORT to change it).
-# It holds the trader and maker wallets from keys/ and proves on this
+# It holds the maker wallets from keys/ and proves on this
 # machine. The web app reaches it through Vite's /api proxy.
 #
 # Needs .env with HELIUS_API_KEY, the wallets scripts/devnet-setup.sh makes,

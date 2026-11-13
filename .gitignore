@@ -7,3 +7,5 @@ test/test-ledger/
 .env
 # The desk service's record of positions and transactions.
 .desk/
+# The web app is its own repository, checked out here on the server.
+/app/
