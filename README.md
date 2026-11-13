@@ -121,9 +121,9 @@ The [docs](https://darkring.io/docs) explain all of this for traders, with a wor
 
 | | Address |
 | --- | --- |
-| Darkring program | [`HY5QBm2yMqKDRnYSU11qi5ZeD3m2hL4WUUT2WLTzvWNF`](https://explorer.solana.com/address/HY5QBm2yMqKDRnYSU11qi5ZeD3m2hL4WUUT2WLTzvWNF?cluster=devnet) |
-| Test dollar mint | [`3vAru2sJGnNQAbYLQK8eAJGkPsDirj3uMKR6s2qzjG8r`](https://explorer.solana.com/address/3vAru2sJGnNQAbYLQK8eAJGkPsDirj3uMKR6s2qzjG8r?cluster=devnet) |
-| Rings shielded pool | [`ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW`](https://explorer.solana.com/address/ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW?cluster=devnet) |
+| Darkring program | [`HY5QBm2yMqKDRnYSU11qi5ZeD3m2hL4WUUT2WLTzvWNF`](https://solscan.io/account/HY5QBm2yMqKDRnYSU11qi5ZeD3m2hL4WUUT2WLTzvWNF?cluster=devnet) |
+| Test dollar mint | [`3vAru2sJGnNQAbYLQK8eAJGkPsDirj3uMKR6s2qzjG8r`](https://solscan.io/token/3vAru2sJGnNQAbYLQK8eAJGkPsDirj3uMKR6s2qzjG8r?cluster=devnet) |
+| Rings shielded pool | [`ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW`](https://solscan.io/account/ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW?cluster=devnet) |
 
 **Markets.** SOL, BTC, ETH, HYPE, JUP, RAY, PYTH, WIF, BONK, FARTCOIN and PUMP, each against the dollar. A market needs nothing deployed, only a Pyth price feed, so the list is a table in [`service/src/chain.rs`](service/src/chain.rs).
 

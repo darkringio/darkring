@@ -101,7 +101,7 @@ fn send(rpc: &SolanaRpc, payer: &dyn Signer, ix: Instruction) -> Result<Signatur
 }
 
 fn explorer(label: &str, signature: &Signature) {
-    println!("DEVNET {label}: https://explorer.solana.com/tx/{signature}?cluster=devnet");
+    println!("DEVNET {label}: https://solscan.io/tx/{signature}?cluster=devnet");
 }
 
 /// The oracle account's price, whatever its age.

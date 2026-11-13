@@ -70,4 +70,4 @@ fi
     --url "$rpc_url"
 
 "$solana" program show "$program_id" --url "$rpc_url"
-echo "https://explorer.solana.com/address/$program_id?cluster=devnet"
+echo "https://solscan.io/account/$program_id?cluster=devnet"
