@@ -26,7 +26,7 @@
 
 Darkring is a perpetuals protocol where the position itself is private. You go long or short with leverage, like on any perps venue, and nobody watching the chain can tell what you hold. It is built on [Solana Privacy Rings](https://github.com/helius-labs/zolana), the shielded pool by Helius.
 
-This repository is the protocol: the on-chain program, the SDK, the desk service and the tests. The website and the trading app live in [darkring-app](https://github.com/darkringio/darkring-app).
+This repository is the protocol: the on-chain program, the SDK, the desk service and the tests. The website and the trading app are a separate codebase; you can use them at [app.darkring.io](https://app.darkring.io).
 
 > [!WARNING]
 > **Devnet only. Not audited.** The circuits use insecure test keys made from a fixed public seed, so anyone can forge the proofs, and the program builds only with the `insecure-test-setup` feature. Do not use it with real funds. A mainnet deployment needs its own trusted setup, verifying keys, program ID and audit.
@@ -178,6 +178,5 @@ A trader's wallet signs one message, and the browser derives a separate trading 
 | Risks | https://darkring.io/risks |
 | X | [@darkringio](https://x.com/darkringio) |
 | GitHub | [darkringio](https://github.com/darkringio) |
-| Web app source | [darkring-app](https://github.com/darkringio/darkring-app) |
 
 Built on [Solana Privacy Rings](https://github.com/helius-labs/zolana) by Helius, with prices from [Pyth](https://pyth.network). Darkring is an independent project and is not affiliated with or endorsed by Helius, the Solana Foundation or Pyth.
