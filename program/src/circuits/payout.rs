@@ -1,4 +1,4 @@
-//! Settlement math of a dark perp position.
+//! Settlement math of a Darkring position.
 //!
 //! Plain integer code with no SDK types, so the same function runs natively
 //! on the client, compiles into the settle circuit, and is unit-tested on its

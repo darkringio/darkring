@@ -1,4 +1,4 @@
-//! The dark perps circuits: Rust that runs natively on the client to build
+//! The Darkring circuits: Rust that runs natively on the client to build
 //! the SPP transaction, and compiles through Xark for proving.
 //!
 //! `quote`, `open`, `settle` and `cancel_quote` over the `perp_terms`

@@ -153,7 +153,7 @@ fn shielded(actor: u8) -> Result<ShieldedKeypair> {
 pub fn setup(test: u16) -> Result<TestEnv> {
     let ports = LocalnetPorts::for_test(test)?;
     let localnet = FixtureLocalnet::start(
-        "dark-perps",
+        "darkring",
         ports,
         vec![
             (perps_program::ID, deploy_path("perps_program.so")),

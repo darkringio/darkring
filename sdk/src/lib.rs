@@ -1,4 +1,4 @@
-//! Client SDK for the dark perps program: quote and position state,
+//! Client SDK for the Darkring program: quote and position state,
 //! transaction builders, Xark proofs, instruction builders and discovery.
 pub mod index;
 pub mod instructions;
