@@ -2,13 +2,13 @@ use anyhow::{anyhow, ensure, Result};
 use perps_program::circuits::{OpenClient, OpenPrivateInputsClient, OpenPublicInputsClient};
 use solana_address::Address;
 use spr_client::SprIndexer;
-use spr_keypair::ShieldedKeypair;
 use spr_program::{ProgramProofInputs, TransactionOptions};
 use spr_transaction::{instructions::transact::SppProofInputs, WalletUtxo};
 
 use super::Open;
 use crate::{
     err,
+    party::Party,
     proof::{self, CircuitId},
     shared::{field, identity, open_blinding_seed, prove_transact, WithAuthorityInputs},
     state::{PositionUtxo, QuoteUtxo},
@@ -54,9 +54,11 @@ impl OpenTransactionParams {
     ///    seed, with the quote expiry as the transact expiry.
     /// 3. Check the maker can derive the position from the quote opening.
     /// 4. Encrypt the outputs.
-    pub fn build(self, trader: &ShieldedKeypair) -> Result<OpenTransaction> {
+    ///
+    /// `trader` need not hold the key that signs: see [`Party`].
+    pub fn build(self, trader: &impl Party) -> Result<OpenTransaction> {
         // 1. Check the margin input and the designated trader.
-        let sender = trader.shielded_address().map_err(err)?;
+        let sender = trader.shielded_address()?;
         let terms = &self.quote_utxo.terms;
         ensure!(
             self.trader_input.utxo.asset == self.quote_utxo.collateral_mint,
@@ -67,7 +69,7 @@ impl OpenTransactionParams {
             "the margin input holds less than the trader margin"
         );
         ensure!(
-            self.trader_input.utxo.owner == trader.signing_pubkey(),
+            self.trader_input.utxo.owner == sender.signing_pubkey,
             "the margin input is not owned by the trader"
         );
         ensure!(
@@ -131,6 +133,7 @@ impl OpenTransactionParams {
 
         // 4. Encrypt the outputs.
         let key = trader
+            .viewing_key()
             .get_transaction_viewing_key(&first_nullifier)
             .map_err(err)?;
         let spp_proof_inputs = finalized.encrypt_with_viewing_key(&key).map_err(err)?;
@@ -152,12 +155,16 @@ impl OpenTransaction {
         self,
         indexer: &SprIndexer,
         tree: Address,
-        trader: &ShieldedKeypair,
+        trader: &impl Party,
     ) -> Result<Open> {
         let payer = self.spp_proof_inputs.payer;
         // 1. Prove the SPP transaction.
         let spp_proof =
-            prove_transact(indexer, self.spp_proof_inputs, &WithAuthorityInputs(trader))?;
+            prove_transact(
+            indexer,
+            self.spp_proof_inputs,
+            &WithAuthorityInputs(trader.nullifier_key()),
+        )?;
         // 2. Prove the open circuit and build the instruction.
         let open_proof = proof::prove(CircuitId::Open, &self.proof_inputs)?;
         Ok(Open {

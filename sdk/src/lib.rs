@@ -2,6 +2,7 @@
 //! transaction builders, Xark proofs, instruction builders and discovery.
 pub mod index;
 pub mod instructions;
+pub mod party;
 pub mod proof;
 pub mod shared;
 pub mod state;
@@ -18,6 +19,7 @@ pub use perps_program::{
     },
     maker_authority_seeds, tag, MAKER_AUTHORITY_PDA_SEED,
 };
+pub use party::{Party, ViewKeys};
 use solana_address::Address;
 use spr_program::ProgramOwner;
 

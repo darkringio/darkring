@@ -2,13 +2,13 @@ use anyhow::{anyhow, ensure, Result};
 use perps_program::circuits::{SettleClient, SettlePrivateInputsClient, SettlePublicInputsClient};
 use solana_address::Address;
 use spr_client::SprIndexer;
-use spr_keypair::ShieldedKeypair;
 use spr_program::{ProgramOwner, ProgramProofInputs, TransactionOptions};
 use spr_transaction::instructions::transact::SppProofInputs;
 
 use super::Settle;
 use crate::{
     err,
+    party::Party,
     proof::{self, CircuitId},
     shared::{feed_halves, field, identity, prove_transact, settle_blinding_seed},
     state::PositionUtxo,
@@ -56,9 +56,9 @@ impl SettleTransactionParams {
     /// 3. Check both parties can derive their payouts from the position
     ///    opening.
     /// 4. Encrypt the outputs.
-    pub fn build(self, settler: &ShieldedKeypair) -> Result<SettleTransaction> {
+    pub fn build(self, settler: &impl Party) -> Result<SettleTransaction> {
         // 1. Check the settler may settle.
-        let sender = settler.shielded_address().map_err(err)?;
+        let sender = settler.shielded_address()?;
         let terms = &self.position_utxo.terms;
         let signer = sender.solana_address().map_err(err)?;
         if sender == terms.maker {
@@ -128,6 +128,7 @@ impl SettleTransactionParams {
 
         // 4. Encrypt the outputs.
         let key = settler
+            .viewing_key()
             .get_transaction_viewing_key(&first_nullifier)
             .map_err(err)?;
         let spp_proof_inputs = finalized.encrypt_with_viewing_key(&key).map_err(err)?;

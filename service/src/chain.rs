@@ -3,13 +3,14 @@
 
 use std::{
     path::PathBuf,
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
-use perps_sdk::OraclePrice;
+use perps_sdk::{shared::feed_halves, OraclePrice};
 use solana_address::Address;
-use solana_instruction::Instruction;
+use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_signature::Signature;
 use solana_signer::Signer;
@@ -18,23 +19,181 @@ use spr_client::{
     ProverClient, Rpc, SolanaRpc, SprClient, SprIndexer,
 };
 use spr_interface::{pda, state::tree::read_tree_id};
-use spr_keypair::{ShieldedKeypair, SigningKey};
+use spr_keypair::{ShieldedAddress, ShieldedKeypair, SigningKey};
 use spr_test_utils::{
     test_validator_asserts::wait_for_indexed_utxo,
     wallet::{sync_wallet, Deposit, DepositParams, Filter, Wallet},
 };
 use spr_transaction::{AssetRegistry, WalletUtxo};
 
+use crate::desk::unhex;
+
 // The whole per-transaction budget: an instruction verifies an SPP proof and
 // its own.
 const TRANSACT_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 
-/// Pyth SOL/USD, and the price update account Pyth keeps for it on devnet.
-pub const FEED_ID: [u8; 32] = [
-    0xef, 0x0d, 0x8b, 0x6f, 0xda, 0x2c, 0xeb, 0xa4, 0x1d, 0xa1, 0x5d, 0x40, 0x95, 0xd1, 0xda, 0x39,
-    0x2a, 0x0d, 0x2f, 0x8e, 0xd0, 0xc6, 0xc7, 0xbc, 0x0f, 0x4c, 0xfa, 0xc8, 0xc2, 0x80, 0xb5, 0x6d,
+/// A market: a Pyth feed, and the price update accounts kept for it on
+/// devnet. The program settles a position against whichever feed its quote
+/// named, read from any account that holds a fully verified price for it,
+/// so a market needs nothing deployed: only a feed that is kept fresh.
+pub struct Market {
+    pub symbol: &'static str,
+    pub name: &'static str,
+    pub feed: [u8; 32],
+    /// Every account the desk reads this feed from. It uses whichever holds
+    /// the newest price.
+    pub oracles: Vec<Address>,
+    /// The feed's exponent: a price tick is ten to this power, in dollars.
+    pub expo: i32,
+}
+
+impl Market {
+    /// Size units in one whole unit of the asset. Size counts collateral
+    /// base units per price tick, times the program's size scale, so this
+    /// is 10^(6 + expo + 9).
+    pub fn size_per_unit(&self) -> f64 {
+        10f64.powi(15 + self.expo)
+    }
+}
+
+/// A market's price, and the account it was read from: a settle names the
+/// account, and the program reads the same price there.
+#[derive(Clone, Copy)]
+pub struct Mark {
+    pub price: u64,
+    pub publish_time: i64,
+    pub account: Address,
+}
+
+/// Symbol, name, feed id, price accounts, exponent. These are the crypto
+/// feeds kept fresh on devnet that trade around the clock. Pyth's sponsored
+/// accounts (the last one listed for each market) are refreshed about every
+/// five minutes. SOL, BTC, ETH and HYPE also have accounts on another shard
+/// of Pyth's push oracle that were being refreshed every 70 seconds when
+/// this was written (2026-11-13); those are listed first, and the desk falls
+/// back to the sponsored account whenever it holds the newer price.
+/// Metals, currencies and stocks have accounts too, but their prices stop
+/// outside market hours, and a position nobody can close over a weekend is
+/// not one to offer.
+const MARKETS: [(&str, &str, &str, &[&str], i32); 11] = [
+    (
+        "SOL",
+        "Solana",
+        "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+        &[
+            "6bWEn5B8eJCRAek5acd3R7d4Sx3e7JWvt84srqqfYgt",
+            "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+        ],
+        -8,
+    ),
+    (
+        "BTC",
+        "Bitcoin",
+        "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+        &[
+            "CQanas4srymHLigVyu56ynJhKZzKYJvBa45VAsTgXSvM",
+            "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo",
+        ],
+        -8,
+    ),
+    (
+        "ETH",
+        "Ethereum",
+        "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+        &[
+            "4Ruku1Seg5iaUQT9pQmbfR9RB1r4iYWmiZhrh9A2idwo",
+            "42amVS4KgzR9rA28tkVYqVXjq9Qa8dcZQMbH5EYFX6XC",
+        ],
+        -8,
+    ),
+    (
+        "HYPE",
+        "Hyperliquid",
+        "4279e31cc369bbcc2faf022b382b080e32a8e689ff20fbc530d2a603eb6cd98b",
+        &["3dndBghRKt4ZmuCSMDRNM2urEZKagoM4o15YHtN2LbeJ"],
+        -8,
+    ),
+    (
+        "JUP",
+        "Jupiter",
+        "0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996",
+        &["7dbob1psH1iZBS7qPsm3Kwbf5DzSXK8Jyg31CTgTnxH5"],
+        -8,
+    ),
+    (
+        "RAY",
+        "Raydium",
+        "91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a",
+        &["Hhipna3EoWR7u8pDruUg8RxhP5F6XLh6SEHMVDmZhWi8"],
+        -8,
+    ),
+    (
+        "PYTH",
+        "Pyth Network",
+        "0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d06719579ff",
+        &["8vjchtMuJNY4oFQdTi8yCe6mhCaNBFaUbktT482TpLPS"],
+        -8,
+    ),
+    (
+        "WIF",
+        "dogwifhat",
+        "4ca4beeca86f0d164160323817a4e42b10010a724c2217c6ee41b54cd4cc61fc",
+        &["6B23K3tkb51vLZA14jcEQVCA1pfHptzEHFA93V5dYwbT"],
+        -8,
+    ),
+    (
+        "BONK",
+        "Bonk",
+        "72b021217ca3fe68922a19aaf990109cb9d84e9ad004b4d2025ad6f529314419",
+        &["DBE3N8uNjhKPRHfANdwGvCZghWXyLPdqdSbEW2XFwBiX"],
+        -10,
+    ),
+    (
+        "FARTCOIN",
+        "Fartcoin",
+        "58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608",
+        &["2t8eUbYKjidMs3uSeYM9jXM9uudYZwGkSeTB4TKjmvnC"],
+        -8,
+    ),
+    (
+        "PUMP",
+        "Pump.fun",
+        "7a01fca212788bba7c5bf8c9efd576a8a722f070d2c17596ff7bb609b8d5c3b9",
+        &["HMm3GPbdnqGwbkTnUUqCFsH8AMHDdEC3Lg8gcPD3HJSH"],
+        -8,
+    ),
 ];
-pub const ORACLE: Address = Address::from_str_const("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE");
+
+pub fn markets() -> &'static [Market] {
+    static TABLE: OnceLock<Vec<Market>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        MARKETS
+            .iter()
+            .map(|&(symbol, name, feed, oracles, expo)| Market {
+                symbol,
+                name,
+                feed: unhex(feed).expect("a feed id is 32 bytes of hex"),
+                oracles: oracles
+                    .iter()
+                    .map(|oracle| Address::from_str_const(oracle))
+                    .collect(),
+                expo,
+            })
+            .collect()
+    })
+}
+
+pub fn market(symbol: &str) -> Option<&'static Market> {
+    markets().iter().find(|market| market.symbol == symbol)
+}
+
+/// The market a quote's or a position's feed id names.
+pub fn market_of(feed: &[u8; 32]) -> Result<&'static Market> {
+    markets()
+        .iter()
+        .find(|market| &market.feed == feed)
+        .ok_or_else(|| anyhow!("the desk has no market for that feed"))
+}
 
 /// The devnet program's price window (its `devnet-oracle` feature), and how
 /// much of it a settle may use: the rest is left for proving and landing.
@@ -138,40 +297,86 @@ impl Chain {
         Ok(())
     }
 
-    /// The oracle account's price, whatever its age.
-    pub fn oracle(&self) -> Result<OraclePrice> {
-        let account = self
+    /// The newest price any of `market`'s accounts holds for its feed,
+    /// whatever its age.
+    pub fn mark(&self, market: &Market) -> Result<Mark> {
+        let accounts = self
             .client
             .rpc()
-            .get_account(ORACLE)?
-            .ok_or_else(|| anyhow!("no oracle account {ORACLE}"))?;
-        OraclePrice::parse(&account.data).map_err(|e| anyhow!("oracle account: {e:?}"))
+            .get_multiple_accounts(market.oracles.clone())?;
+        newest(market, &market.oracles, &accounts)
+            .ok_or_else(|| anyhow!("no price account for {}", market.symbol))
     }
 
-    /// The oracle price, if a settle sent now would still be inside the
-    /// program's window when it lands.
-    pub fn settle_price(&self) -> Result<u64> {
-        let price = self.oracle()?;
-        let age = now() - price.publish_time;
+    /// Every market's newest price, in the order of [`markets`], read in
+    /// one call. A market none of whose accounts parses is `None`.
+    pub fn marks(&self) -> Result<Vec<Option<Mark>>> {
+        let addresses: Vec<Address> = markets()
+            .iter()
+            .flat_map(|market| market.oracles.iter().copied())
+            .collect();
+        let accounts = self.client.rpc().get_multiple_accounts(addresses.clone())?;
+        let mut from = 0;
+        Ok(markets()
+            .iter()
+            .map(|market| {
+                let to = from + market.oracles.len();
+                let mark = newest(market, &addresses[from..to], &accounts[from..to]);
+                from = to;
+                mark
+            })
+            .collect())
+    }
+
+    /// `market`'s newest price, if a settle sent now would still be inside
+    /// the program's window when it lands.
+    pub fn settle_mark(&self, market: &Market) -> Result<Mark> {
+        let mark = self.mark(market)?;
+        let age = now() - mark.publish_time;
         if age > SETTLE_PRICE_AGE_SECS {
             anyhow::bail!(
-                "the oracle price is {age} seconds old; Pyth refreshes it within a few minutes"
+                "the {} price is {age} seconds old; Pyth refreshes it within a few minutes",
+                market.symbol
             );
         }
-        Ok(price.price)
+        Ok(mark)
     }
+}
 
+/// The newest price for `market`'s feed among `accounts`, which are the
+/// accounts at `addresses`. An account that does not parse, or holds another
+/// feed, is passed over.
+fn newest(
+    market: &Market,
+    addresses: &[Address],
+    accounts: &[Option<solana_account::Account>],
+) -> Option<Mark> {
+    addresses
+        .iter()
+        .zip(accounts)
+        .filter_map(|(address, account)| {
+            let price = OraclePrice::parse(&account.as_ref()?.data).ok()?;
+            ((price.feed_hi, price.feed_lo) == feed_halves(&market.feed)).then_some(Mark {
+                price: price.price,
+                publish_time: price.publish_time,
+                account: *address,
+            })
+        })
+        .max_by_key(|mark| mark.publish_time)
+}
+
+impl Chain {
     /// Shields `amount` test dollars from the deployer's token account to
     /// `recipient`, and waits for the note to be indexed.
     pub fn shield(
         &self,
         deployer: &Keypair,
-        recipient: &ShieldedKeypair,
+        recipient: &ShieldedAddress,
         amount: u64,
     ) -> Result<Signature> {
         let funding = pda::associated_token_address(&deployer.pubkey(), &self.mint);
         let deposit = Deposit::new(DepositParams {
-            recipient: &recipient.shielded_address()?,
+            recipient,
             asset: self.mint,
             amount,
             spl_token_account: Some(funding),
@@ -185,7 +390,31 @@ impl Chain {
     }
 }
 
-/// One wallet: its keys and the notes it has decrypted so far.
+impl Chain {
+    /// Sends `lamports` of devnet SOL from `from` to `to`, for fees.
+    pub fn transfer_sol(&self, from: &Keypair, to: Address, lamports: u64) -> Result<Signature> {
+        // The System program's Transfer: its index, then the amount.
+        let mut data = 2u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&lamports.to_le_bytes());
+        let instruction = Instruction {
+            program_id: Address::default(),
+            accounts: vec![
+                AccountMeta::new(from.pubkey(), true),
+                AccountMeta::new(to, false),
+            ],
+            data,
+        };
+        Ok(self.client.rpc().create_and_send_transaction(
+            std::slice::from_ref(&instruction),
+            from.pubkey(),
+            &[from],
+            ComputeBudgetConfig::for_instruction_count(1),
+        )?)
+    }
+}
+
+/// One wallet the desk holds the keys of: a maker's, with the notes it has
+/// decrypted so far.
 pub struct Actor {
     pub keypair: ShieldedKeypair,
     pub wallet: Wallet,

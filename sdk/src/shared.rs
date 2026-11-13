@@ -4,7 +4,7 @@ use solana_instruction::AccountMeta;
 use spr_client::{ProofAuthority, SprIndexer, TransferInput};
 use spr_hasher::primitives::solana_owner_identity;
 use spr_interface::instruction::instruction_data::transact::TransactIxData;
-use spr_keypair::ShieldedKeypair;
+use spr_keypair::NullifierKey;
 use spr_program::{instruction::Transact, poseidon, Field, ProgramOwner};
 use spr_transaction::instructions::transact::SppProofInputs;
 
@@ -86,8 +86,9 @@ pub(crate) fn prove_transact(
 }
 
 /// The proof authority of a transaction that spends a UTXO of a maker's
-/// authority PDA, under the zero nullifier key, next to the user's own.
-pub struct WithAuthorityInputs<'a>(pub &'a ShieldedKeypair);
+/// authority PDA, under the zero nullifier key, next to the user's own,
+/// under the user's nullifier key.
+pub struct WithAuthorityInputs<'a>(pub &'a NullifierKey);
 
 impl ProofAuthority for WithAuthorityInputs<'_> {
     fn complete_inputs(&self, inputs: &mut [TransferInput]) -> Result<(), spr_client::ClientError> {

@@ -1,16 +1,26 @@
-//! What the web app sees: one snapshot, shared by the actors' threads.
+//! What the web app sees, shared by the actors' threads: the market, which
+//! is the same for everyone, and one book per trading account, which only
+//! that account's sessions can read.
 //!
 //! Amounts are decimal strings, since they do not fit a JSON number: prices
 //! in oracle ticks, sizes in size units, dollars in base units.
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use spr_keypair::ShieldedAddress;
 
 use crate::chain::now_ms;
+
+/// A session nobody has used for this long is closed, and the account's
+/// keys leave this process with its last session.
+const SESSION_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
 
 const LEDGER_LENGTH: usize = 60;
 
@@ -25,10 +35,29 @@ pub struct MakerView {
     pub coverage: f64,
 }
 
+/// A market and its mark price.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketView {
+    pub symbol: String,
+    pub name: String,
+    /// The feed's exponent: a price tick is ten to this power, in dollars.
+    pub expo: i32,
+    /// The oracle account's price and when Pyth published it (unix seconds).
+    pub price: String,
+    pub publish_time: i64,
+    pub oracle: String,
+}
+
+fn sol() -> String {
+    "SOL".into()
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteView {
     pub id: String,
+    pub market: String,
     pub maker: MakerView,
     pub side: String,
     pub size: String,
@@ -46,6 +75,10 @@ pub struct QuoteView {
 pub struct PositionView {
     pub id: String,
     pub frame: u32,
+    /// The market's symbol. Positions recorded before there was more than
+    /// one market are SOL.
+    #[serde(default = "sol")]
+    pub market: String,
     pub maker: MakerView,
     pub side: String,
     pub size: String,
@@ -74,7 +107,10 @@ pub struct EventView {
     /// The wallet that signed.
     pub actor: String,
     pub counterparty: Option<String>,
-    /// A settle reveals the oracle price it read, nothing else.
+    /// A settle reveals the market and the oracle price it read, nothing
+    /// else.
+    #[serde(default)]
+    pub market: Option<String>,
     pub price: Option<String>,
     /// What the transaction carries but nobody else can read.
     pub sealed: Vec<String>,
@@ -101,52 +137,81 @@ impl Busy {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+/// A transaction the account's browser has to sign: the desk builds and
+/// proves, but the key that signs never leaves the browser.
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Desk {
-    /// False until every wallet is connected, registered and funded.
-    pub ready: bool,
-    pub network: String,
-    pub program: String,
-    pub mint: String,
-    /// The trader's Solana address.
-    pub wallet: String,
-    /// The trader's sealed balance.
+pub struct SignRequest {
+    pub id: u64,
+    /// The transaction message, in hex.
+    pub message: String,
+}
+
+/// One trading account's side of the desk.
+#[derive(Default)]
+pub struct Book {
+    /// The account's private balance.
     pub balance: String,
-    /// The oracle account's price and when Pyth published it (unix seconds).
-    pub price: String,
-    pub publish_time: i64,
-    /// How old a price the program still settles at, in seconds.
-    pub max_price_age: i64,
-    pub makers: Vec<MakerView>,
     pub quotes: Vec<QuoteView>,
     pub positions: Vec<PositionView>,
     pub ledger: Vec<EventView>,
     pub busy: Option<Busy>,
     /// Why the last action failed, until the next one starts.
     pub error: Option<String>,
+    pub sign: Option<SignRequest>,
+    /// The browser's answer to `sign`, until the signer collects it.
+    signed: Option<(u64, [u8; 64])>,
     /// Makers that have not yet answered the current request.
-    #[serde(skip)]
     pub awaiting_quotes: usize,
+    /// Set while the account wants the best quote opened as soon as every
+    /// maker has answered: the mark when it asked, to judge the quotes by.
+    pub take: Option<u64>,
+    sequence: u64,
+}
+
+struct Session {
+    account: String,
+    address: ShieldedAddress,
+    seen: Instant,
+}
+
+#[derive(Default)]
+pub struct Desk {
+    /// False until every maker is connected, registered and funded.
+    pub ready: bool,
+    pub network: String,
+    pub program: String,
+    pub mint: String,
+    pub markets: Vec<MarketView>,
+    /// How old a price the program still settles at, in seconds.
+    pub max_price_age: i64,
+    pub makers: Vec<MakerView>,
+    /// The books, by the account's Solana address.
+    pub books: HashMap<String, Book>,
     /// Quotes that are spent or reclaimed, by id, so a restart does not try
     /// to cancel them again.
-    #[serde(skip)]
     pub closed_quotes: Vec<String>,
     /// Actors still connecting.
-    #[serde(skip)]
     pub booting: usize,
-    #[serde(skip)]
-    pub sequence: u64,
+    sessions: HashMap<String, Session>,
+    next_sign: u64,
 }
 
 /// What survives a restart. Open positions are matched again with what the
-/// makers find on chain; the rest is history only this file holds.
+/// makers find on chain; the rest is history only this file holds. No key
+/// is ever written here.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Saved {
+    books: HashMap<String, SavedBook>,
+    closed_quotes: Vec<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SavedBook {
     positions: Vec<PositionView>,
     ledger: Vec<EventView>,
-    closed_quotes: Vec<String>,
 }
 
 pub struct Shared {
@@ -160,13 +225,25 @@ impl Shared {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
-        let sequence = saved.ledger.len() as u64 + saved.positions.len() as u64;
+        let books = saved
+            .books
+            .into_iter()
+            .map(|(account, book)| {
+                let sequence = book.ledger.len() as u64 + book.positions.len() as u64;
+                let book = Book {
+                    balance: "0".into(),
+                    positions: book.positions,
+                    ledger: book.ledger,
+                    sequence,
+                    ..Book::default()
+                };
+                (account, book)
+            })
+            .collect();
         Self {
             desk: Mutex::new(Desk {
-                positions: saved.positions,
-                ledger: saved.ledger,
+                books,
                 closed_quotes: saved.closed_quotes,
-                sequence,
                 ..desk
             }),
             file,
@@ -179,8 +256,31 @@ impl Shared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn snapshot(&self) -> String {
-        serde_json::to_string(&*self.lock()).unwrap_or_else(|_| "{}".into())
+    /// The market, and `account`'s book when there is one.
+    pub fn snapshot(&self, account: Option<&str>) -> Value {
+        let desk = self.lock();
+        let empty = Book::default();
+        let book = account
+            .and_then(|account| desk.books.get(account))
+            .unwrap_or(&empty);
+        json!({
+            "ready": desk.ready,
+            "network": desk.network,
+            "program": desk.program,
+            "mint": desk.mint,
+            "markets": desk.markets,
+            "maxPriceAge": desk.max_price_age,
+            "makers": desk.makers,
+            "session": account.is_some(),
+            "wallet": account.unwrap_or(""),
+            "balance": if book.balance.is_empty() { "0" } else { &book.balance },
+            "quotes": book.quotes,
+            "positions": book.positions,
+            "ledger": book.ledger,
+            "busy": book.busy,
+            "error": book.error,
+            "sign": book.sign,
+        })
     }
 
     /// Changes the desk and writes what must survive a restart.
@@ -188,8 +288,18 @@ impl Shared {
         let mut desk = self.lock();
         let result = change(&mut desk);
         let saved = Saved {
-            positions: desk.positions.clone(),
-            ledger: desk.ledger.clone(),
+            books: desk
+                .books
+                .iter()
+                .filter(|(_, book)| !book.positions.is_empty() || !book.ledger.is_empty())
+                .map(|(account, book)| {
+                    let book = SavedBook {
+                        positions: book.positions.clone(),
+                        ledger: book.ledger.clone(),
+                    };
+                    (account.clone(), book)
+                })
+                .collect(),
             closed_quotes: desk.closed_quotes.clone(),
         };
         drop(desk);
@@ -202,23 +312,136 @@ impl Shared {
         result
     }
 
-    /// Ends the current action with `error` on show.
-    pub fn fail(&self, error: &anyhow::Error) {
+    /// Ends `account`'s current action with `error` on show.
+    pub fn fail(&self, account: &str, error: &anyhow::Error) {
         eprintln!("desk: {error:#}");
         let mut desk = self.lock();
-        desk.busy = None;
-        desk.awaiting_quotes = 0;
-        desk.error = Some(format!("{error:#}"));
+        let book = desk.book(account);
+        book.busy = None;
+        book.sign = None;
+        book.awaiting_quotes = 0;
+        book.take = None;
+        book.error = Some(format!("{error:#}"));
+    }
+
+    /// Shows `label` on `account`'s current action.
+    pub fn label(&self, account: &str, label: &str) {
+        if let Some(busy) = self.lock().book(account).busy.as_mut() {
+            busy.label = label.into();
+        }
+    }
+
+    /// Asks `account`'s browser to sign `message`, and returns the request's
+    /// id.
+    pub fn request_signature(&self, account: &str, message: &[u8]) -> u64 {
+        let mut desk = self.lock();
+        desk.next_sign += 1;
+        let id = desk.next_sign;
+        let book = desk.book(account);
+        book.signed = None;
+        book.sign = Some(SignRequest {
+            id,
+            message: hex(message),
+        });
+        id
+    }
+
+    /// The browser's signature for request `id`, once it has arrived.
+    pub fn signature(&self, account: &str, id: u64) -> Option<[u8; 64]> {
+        let mut desk = self.lock();
+        let book = desk.book(account);
+        match book.signed {
+            Some((signed, signature)) if signed == id => {
+                book.signed = None;
+                book.sign = None;
+                Some(signature)
+            }
+            _ => None,
+        }
+    }
+
+    /// Stops waiting for request `id`.
+    pub fn withdraw_request(&self, account: &str, id: u64) {
+        let mut desk = self.lock();
+        let book = desk.book(account);
+        if book.sign.as_ref().is_some_and(|sign| sign.id == id) {
+            book.sign = None;
+        }
+    }
+
+    /// The browser's answer to request `id`. False when nothing is waiting
+    /// for it any more.
+    pub fn signed(&self, account: &str, id: u64, signature: [u8; 64]) -> bool {
+        let mut desk = self.lock();
+        let book = desk.book(account);
+        if !book.sign.as_ref().is_some_and(|sign| sign.id == id) {
+            return false;
+        }
+        book.signed = Some((id, signature));
+        true
     }
 }
 
 impl Desk {
+    pub fn book(&mut self, account: &str) -> &mut Book {
+        self.books.entry(account.into()).or_insert_with(|| Book {
+            balance: "0".into(),
+            ..Book::default()
+        })
+    }
+
+    /// One actor is connected, registered and funded.
+    pub fn booted(&mut self) {
+        self.booting = self.booting.saturating_sub(1);
+        if self.booting == 0 {
+            self.ready = true;
+        }
+    }
+
+    pub fn open_session(&mut self, token: String, account: &str, address: ShieldedAddress) {
+        self.sessions.insert(
+            token,
+            Session {
+                account: account.into(),
+                address,
+                seen: Instant::now(),
+            },
+        );
+    }
+
+    /// The account `token` speaks for and its address, if the session is
+    /// still open.
+    pub fn session(&mut self, token: &str) -> Option<(String, ShieldedAddress)> {
+        let session = self.sessions.get_mut(token)?;
+        session.seen = Instant::now();
+        Some((session.account.clone(), session.address))
+    }
+
+    pub fn close_session(&mut self, token: &str) {
+        self.sessions.remove(token);
+    }
+
+    /// Closes the sessions nobody has used for a while.
+    pub fn expire_sessions(&mut self) {
+        self.sessions
+            .retain(|_, session| session.seen.elapsed() < SESSION_IDLE);
+    }
+
+    /// Whether any session still speaks for `account`.
+    pub fn has_session(&self, account: &str) -> bool {
+        self.sessions
+            .values()
+            .any(|session| session.account == account)
+    }
+}
+
+impl Book {
     pub fn log(
         &mut self,
         kind: &str,
         actor: &str,
         counterparty: Option<&str>,
-        price: Option<u64>,
+        settled: Option<(&str, u64)>,
         sealed: &[&str],
         signature: &str,
     ) {
@@ -231,23 +454,13 @@ impl Desk {
                 kind: kind.into(),
                 actor: actor.into(),
                 counterparty: counterparty.map(Into::into),
-                price: price.map(|price| price.to_string()),
+                market: settled.map(|(market, _)| market.into()),
+                price: settled.map(|(_, price)| price.to_string()),
                 sealed: sealed.iter().map(|item| (*item).into()).collect(),
                 signature: signature.into(),
             },
         );
         self.ledger.truncate(LEDGER_LENGTH);
-    }
-
-    /// One actor is connected, registered and funded.
-    pub fn booted(&mut self) {
-        self.booting = self.booting.saturating_sub(1);
-        if self.booting == 0 {
-            self.ready = true;
-            if self.busy.as_ref().is_some_and(|busy| busy.kind == "boot") {
-                self.busy = None;
-            }
-        }
     }
 
     /// One maker has answered, with a quote or without.
@@ -258,4 +471,20 @@ impl Desk {
             self.busy = None;
         }
     }
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The bytes of a hex string of exactly `N` of them.
+pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if text.len() != N * 2 || !text.is_ascii() {
+        return None;
+    }
+    let mut bytes = [0u8; N];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }

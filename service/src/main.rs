@@ -1,12 +1,23 @@
-//! The devnet desk. Holds one trader wallet and three maker wallets, runs
-//! each on a thread of its own against devnet, and serves the web app a
-//! small JSON API on localhost:
+//! The devnet desk. Runs three maker wallets, each on a thread of its own
+//! against devnet, and serves the web app a small JSON API on localhost.
 //!
-//!   GET  /api/state    the whole desk
-//!   POST /api/quotes   {"side":"long","sol":10,"leverage":8}
+//! Traders bring their own account. A browser derives the account's keys
+//! from a wallet signature, keeps the key that signs, and opens a session
+//! here with the seed of the other two: enough for this process to read the
+//! account's notes and to build and prove its transactions, which it sends
+//! back for the browser to sign. The seed is held in memory only, until the
+//! session ends.
+//!
+//!   GET  /api/state    the market, and the session's account
+//!   POST /api/session  {"address":"...","seed":"<hex>"}, answers a token
+//!   POST /api/logout
+//!   POST /api/sign     {"id":7,"signature":"<hex>"}
+//!   POST /api/quotes   {"market":"BTC","side":"long","amount":0.01,"leverage":8}
 //!   POST /api/open     {"quoteId":"..."}
 //!   POST /api/close    {"positionId":"..."}
-//!   POST /api/faucet   shield another 5,000 test dollars to the trader
+//!   POST /api/faucet   shield another 5,000 test dollars to the account
+//!
+//! Everything but the first two needs `Authorization: Bearer <token>`.
 //!
 //! Needs HELIUS_API_KEY (or DEVNET_RPC_URL and DEVNET_SPR_URL), ZOLANA_CLI_BIN
 //! for the local prover, and the wallets scripts/devnet-setup.sh makes.
@@ -18,9 +29,11 @@ mod trader;
 
 use std::{
     env,
+    fs::File,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{mpsc, Arc},
     thread,
     time::Duration,
@@ -28,12 +41,14 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use solana_address::Address;
 use spr_client::ProverLaunch;
 use spr_keypair::{ShieldedKeypair, SigningKey};
+use spr_test_utils::wallet::{ClientEd25519WalletAuthority, SyncWalletAuthority};
 
 use crate::{
-    chain::Config,
-    desk::{Busy, Desk, MakerView, Shared},
+    chain::{market, markets, Config},
+    desk::{hex, unhex, Busy, Desk, MakerView, MarketView, Shared},
     maker::{MakerJob, MakerSpec},
     trader::TraderJob,
 };
@@ -46,8 +61,9 @@ const MAKERS: [(&str, &str, u64, u64); 3] = [
     ("Amory", "devnet-maker-3.json", 9, 30),
 ];
 
-/// Size units per SOL, as the program counts size.
-const SIZE_PER_SOL: f64 = 10_000_000.0;
+/// The most a position may be worth at entry, in dollars: a bound on what
+/// the desk will try to quote, far above what a test balance can open.
+const MAX_NOTIONAL_USD: f64 = 5_000_000.0;
 
 fn config() -> Result<Config> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -68,7 +84,7 @@ fn config() -> Result<Config> {
         keys_dir: root.join("keys"),
         state_file: env::var_os("DESK_STATE_FILE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| root.join(".desk/state.json")),
+            .unwrap_or_else(|| root.join(".desk/accounts.json")),
         port: env::var("DESK_PORT")
             .ok()
             .and_then(|port| port.parse().ok())
@@ -100,7 +116,6 @@ fn main() -> Result<()> {
         .with_keys_dir(Path::new(&home).join(".config/zolana/proving-keys"))?
         .spawn()?;
 
-    let trader_address = shielded(&config, "devnet-trader.json")?.shielded_address()?;
     let mut makers = Vec::new();
     for (name, file, spread_bps, coverage_tenths) in MAKERS {
         let address = shielded(&config, file)?
@@ -114,21 +129,24 @@ fn main() -> Result<()> {
         });
     }
 
-    let shared = Arc::new(Shared::load(
-        config.state_file.clone(),
-        Desk {
-            network: "devnet".into(),
-            program: perps_program::ID.to_string(),
-            wallet: trader_address.solana_address()?.to_string(),
-            balance: "0".into(),
+    let mut desk = Desk::default();
+    desk.network = "devnet".into();
+    desk.program = perps_program::ID.to_string();
+    desk.markets = markets()
+        .iter()
+        .map(|market| MarketView {
+            symbol: market.symbol.into(),
+            name: market.name.into(),
+            expo: market.expo,
             price: "0".into(),
-            max_price_age: trader::max_price_age(),
-            makers: makers.clone(),
-            busy: Some(trader::boot_notice()),
-            booting: MAKERS.len() + 1,
-            ..Desk::default()
-        },
-    ));
+            publish_time: 0,
+            oracle: market.oracles[0].to_string(),
+        })
+        .collect();
+    desk.max_price_age = trader::max_price_age();
+    desk.makers = makers.clone();
+    desk.booting = MAKERS.len() + 1;
+    let shared = Arc::new(Shared::load(config.state_file.clone(), desk));
 
     let (trader_jobs, trader_inbox) = mpsc::channel::<TraderJob>();
     let mut maker_jobs = Vec::new();
@@ -146,15 +164,7 @@ fn main() -> Result<()> {
                 spread_bps,
                 coverage_tenths,
             };
-            maker::run(
-                config,
-                spec,
-                view,
-                trader_address,
-                shared,
-                inbox,
-                trader_jobs,
-            );
+            maker::run(config, spec, view, shared, inbox, trader_jobs);
         });
     }
     {
@@ -181,6 +191,19 @@ fn gone<T>(_: mpsc::SendError<T>) -> anyhow::Error {
     anyhow!("the desk has stopped")
 }
 
+/// The request named a session that is not open: the browser has to open
+/// one again.
+#[derive(Debug)]
+struct NoSession;
+
+impl std::fmt::Display for NoSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("your session has ended; connect your wallet again")
+    }
+}
+
+impl std::error::Error for NoSession {}
+
 /// Answers one HTTP request and closes the connection.
 fn serve(
     mut stream: TcpStream,
@@ -195,6 +218,7 @@ fn serve(
     let mut parts = request_line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let mut length = 0usize;
+    let mut token = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header)? == 0 || header.trim().is_empty() {
@@ -203,16 +227,28 @@ fn serve(
         if let Some((name, value)) = header.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                token = value.trim().strip_prefix("Bearer ").map(str::to_owned);
             }
         }
     }
     let mut body = vec![0; length.min(64 * 1024)];
     reader.read_exact(&mut body)?;
 
-    let (status, payload) = match route(method, path, &body, shared, trader, makers) {
-        Ok(payload) => ("200 OK", payload),
+    let request = Request {
+        method,
+        path: path.split('?').next().unwrap_or(""),
+        token: token.as_deref(),
+        body: &body,
+    };
+    let (status, payload) = match route(&request, shared, trader, makers) {
+        Ok(payload) => ("200 OK", payload.to_string()),
         Err(error) => (
-            "400 Bad Request",
+            if error.is::<NoSession>() {
+                "401 Unauthorized"
+            } else {
+                "400 Bad Request"
+            },
             json!({ "error": format!("{error:#}") }).to_string(),
         ),
     };
@@ -224,25 +260,43 @@ fn serve(
     Ok(())
 }
 
+struct Request<'a> {
+    method: &'a str,
+    path: &'a str,
+    token: Option<&'a str>,
+    body: &'a [u8],
+}
+
+/// A session token: 32 bytes from the system's generator, in hex.
+fn new_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .context("reading /dev/urandom")?;
+    Ok(hex(&bytes))
+}
+
 fn route(
-    method: &str,
-    path: &str,
-    body: &[u8],
+    request: &Request,
     shared: &Shared,
     trader: &mpsc::Sender<TraderJob>,
     makers: &[mpsc::Sender<MakerJob>],
-) -> Result<String> {
-    let path = path.split('?').next().unwrap_or("");
-    if (method, path) == ("GET", "/api/state") {
-        return Ok(shared.snapshot());
+) -> Result<Value> {
+    // Whoever holds an open session's token speaks for its account.
+    let session = match request.token {
+        Some(token) => Some(shared.lock().session(token).ok_or(NoSession)?),
+        None => None,
+    };
+    if (request.method, request.path) == ("GET", "/api/state") {
+        return Ok(shared.snapshot(session.as_ref().map(|(account, _)| account.as_str())));
     }
-    if method != "POST" {
+    if request.method != "POST" {
         bail!("no such route");
     }
-    let body: Value = if body.is_empty() {
+    let body: Value = if request.body.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(body).context("the body is not JSON")?
+        serde_json::from_slice(request.body).context("the body is not JSON")?
     };
     let text = |name: &str| {
         body.get(name)
@@ -251,42 +305,126 @@ fn route(
             .ok_or_else(|| anyhow!("missing {name}"))
     };
 
-    // One action at a time: each is a proof and a transaction.
-    let begin = |busy: Busy| -> Result<()> {
-        let mut desk = shared.lock();
-        if !desk.ready {
+    if request.path == "/api/session" {
+        if !shared.lock().ready {
             bail!("the desk is still connecting to devnet");
         }
-        if desk.busy.is_some() {
-            bail!("the desk is busy");
+        let address = Address::from_str(&text("address")?)
+            .map_err(|_| anyhow!("address is not a Solana address"))?;
+        let seed: [u8; 64] =
+            unhex(&text("seed")?).ok_or_else(|| anyhow!("seed is not 64 bytes of hex"))?;
+        // The seed is the account's own signature over the derivation
+        // message: only the account's key could have made it.
+        let authority = ClientEd25519WalletAuthority::from_derivation_seed(address, &seed)
+            .map_err(|_| anyhow!("the seed is not this account's"))?;
+        let shielded = authority
+            .shielded_address()
+            .map_err(|e| anyhow!("account address: {e:?}"))?;
+        let account = address.to_string();
+        let token = new_token()?;
+        {
+            let mut desk = shared.lock();
+            desk.open_session(token.clone(), &account, shielded);
+            let book = desk.book(&account);
+            // A second tab joins whatever the first is doing.
+            if book.busy.is_none() {
+                book.error = None;
+                book.busy = Some(Busy::new("login", "Setting up your account"));
+                trader
+                    .send(TraderJob::Login {
+                        account: account.clone(),
+                        authority: Box::new(authority),
+                    })
+                    .map_err(gone)?;
+            }
         }
-        desk.error = None;
-        desk.busy = Some(busy);
+        let mut snapshot = shared.snapshot(Some(&account));
+        snapshot["token"] = Value::String(token);
+        return Ok(snapshot);
+    }
+
+    let (account, address) = session.ok_or(NoSession)?;
+    let account = account.as_str();
+
+    // One action at a time for each account: each is a proof and a
+    // transaction.
+    let begin = |busy: Busy| -> Result<()> {
+        let mut desk = shared.lock();
+        let book = desk.book(account);
+        if book.busy.is_some() {
+            bail!("the desk is still on your last request");
+        }
+        book.error = None;
+        book.busy = Some(busy);
         Ok(())
     };
 
-    match path {
+    match request.path {
+        "/api/logout" => {
+            if let Some(token) = request.token {
+                shared.lock().close_session(token);
+            }
+            return Ok(shared.snapshot(None));
+        }
+        "/api/sign" => {
+            let id = body
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("missing id"))?;
+            let signature: [u8; 64] = unhex(&text("signature")?)
+                .ok_or_else(|| anyhow!("signature is not 64 bytes of hex"))?;
+            if !shared.signed(account, id, signature) {
+                bail!("nothing is waiting for that signature");
+            }
+        }
         "/api/quotes" => {
             let long = match text("side")?.as_str() {
                 "long" => true,
                 "short" => false,
                 _ => bail!("side is long or short"),
             };
-            let sol = body.get("sol").and_then(Value::as_f64).unwrap_or(0.0);
+            let symbol = text("market").unwrap_or_else(|_| "SOL".into());
+            let market = market(&symbol).ok_or_else(|| anyhow!("no such market"))?;
+            let amount = body.get("amount").and_then(Value::as_f64).unwrap_or(0.0);
             let leverage = body.get("leverage").and_then(Value::as_u64).unwrap_or(0);
-            if !(sol > 0.0 && sol <= 100_000.0) || !(1..=50).contains(&leverage) {
+            let mark = shared
+                .lock()
+                .markets
+                .iter()
+                .find(|view| view.symbol == symbol)
+                .and_then(|view| view.price.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let notional = amount * mark * 10f64.powi(market.expo);
+            if !(amount > 0.0 && notional.is_finite() && notional <= MAX_NOTIONAL_USD)
+                || !(1..=50).contains(&leverage)
+            {
                 bail!("size or leverage out of range");
             }
-            let size = (sol * SIZE_PER_SOL).round() as u64;
-            begin(Busy::new("quotes", "Asking three makers"))?;
+            let size = (amount * market.size_per_unit()).round();
+            if !(size >= 1.0 && size < u64::MAX as f64) {
+                bail!("size out of range");
+            }
+            let size = size as u64;
+            // `take` makes it a market order: the desk opens the best quote
+            // itself once every maker has answered.
+            let take = body.get("take").and_then(Value::as_bool).unwrap_or(false);
+            begin(Busy::new(
+                if take { "take" } else { "quotes" },
+                "Asking three makers",
+            ))?;
             {
                 let mut desk = shared.lock();
-                desk.quotes.clear();
-                desk.awaiting_quotes = makers.len();
+                let book = desk.book(account);
+                book.quotes.clear();
+                book.awaiting_quotes = makers.len();
+                book.take = take.then_some(mark as u64);
             }
             for maker in makers {
                 maker
                     .send(MakerJob::Quote {
+                        account: account.into(),
+                        market,
+                        trader: address,
                         long,
                         size,
                         leverage,
@@ -300,7 +438,12 @@ fn route(
                 quote_id: Some(quote_id.clone()),
                 ..Busy::new("open", "Proving the open")
             })?;
-            trader.send(TraderJob::Open { quote_id }).map_err(gone)?;
+            trader
+                .send(TraderJob::Open {
+                    account: account.into(),
+                    quote_id,
+                })
+                .map_err(gone)?;
         }
         "/api/close" => {
             let position_id = text("positionId")?;
@@ -309,14 +452,21 @@ fn route(
                 ..Busy::new("close", "Proving the close")
             })?;
             trader
-                .send(TraderJob::Close { position_id })
+                .send(TraderJob::Close {
+                    account: account.into(),
+                    position_id,
+                })
                 .map_err(gone)?;
         }
         "/api/faucet" => {
-            begin(Busy::new("faucet", "Shielding test dollars"))?;
-            trader.send(TraderJob::Faucet).map_err(gone)?;
+            begin(Busy::new("faucet", "Adding test dollars"))?;
+            trader
+                .send(TraderJob::Faucet {
+                    account: account.into(),
+                })
+                .map_err(gone)?;
         }
         _ => bail!("no such route"),
     }
-    Ok(shared.snapshot())
+    Ok(shared.snapshot(Some(account)))
 }

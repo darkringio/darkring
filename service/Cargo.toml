@@ -4,9 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
-# The devnet desk: one trader wallet and three maker wallets held by this
-# process, driven over a local HTTP API by the web app. A demo: a real
-# deployment would keep the trader's keys and proving in the browser.
+# The devnet desk: three maker wallets held by this process, and a trading
+# account for every browser that opens a session. The browser keeps the key
+# that signs; this process holds the account's viewing and nullifier keys
+# while the session lasts, to build and prove. A real deployment would prove
+# in the browser too.
 
 [dependencies]
 anyhow = { workspace = true }
@@ -14,6 +16,7 @@ perps-program = { path = "../program", features = ["circuits"] }
 perps-sdk = { path = "../sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+solana-account = { workspace = true }
 solana-address = { workspace = true }
 solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
@@ -25,3 +28,4 @@ spr-keypair = { workspace = true }
 spr-program = { workspace = true, features = ["client"] }
 spr-test-utils = { workspace = true }
 spr-transaction = { workspace = true }
+spr-user-registry-interface = { workspace = true, features = ["solana"] }

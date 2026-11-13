@@ -22,13 +22,12 @@ use perps_sdk::{
     state::{PositionUtxo, QuoteTerms, QuoteUtxo},
     SIZE_SCALE,
 };
-use solana_address::Address;
 use solana_keypair::Keypair;
 use spr_keypair::ShieldedAddress;
 use spr_test_utils::test_validator_asserts::wait_for_merkle_proof;
 
 use crate::{
-    chain::{now, now_ms, solana_keypair, Actor, Chain, Config, FEED_ID, ORACLE, USDC},
+    chain::{market_of, now, now_ms, solana_keypair, Actor, Chain, Config, Mark, Market, USDC},
     desk::{MakerView, PositionView, Shared},
     trader::TraderJob,
 };
@@ -52,13 +51,20 @@ pub struct MakerSpec {
 }
 
 pub enum MakerJob {
+    /// `account` asked for a quote; `trader` is its address.
     Quote {
+        account: String,
+        market: &'static Market,
+        trader: ShieldedAddress,
         long: bool,
         size: u64,
         leverage: u64,
     },
+    /// `account` has a session again: tell it what it has open here.
+    Resend { account: String },
     /// The trader opened this maker's quote.
     Opened {
+        account: String,
         quote_id: String,
         position_id: String,
         position: Box<PositionUtxo>,
@@ -76,6 +82,8 @@ pub fn id_of(hash: &[u8; 32]) -> String {
 
 struct Pending {
     id: String,
+    /// The account the quote was for, when this run posted it.
+    account: Option<String>,
     quote: QuoteUtxo,
     leaf: u64,
     attempts: u8,
@@ -83,8 +91,15 @@ struct Pending {
 
 struct Held {
     id: String,
+    /// The trader's Solana address: the account whose position this is.
+    account: String,
     position: PositionUtxo,
     leaf: u64,
+}
+
+/// The account a position belongs to: its trader's Solana address.
+fn account_of(position: &PositionUtxo) -> Result<String> {
+    Ok(position.terms.trader.solana_address()?.to_string())
 }
 
 struct Maker {
@@ -92,8 +107,6 @@ struct Maker {
     view: MakerView,
     chain: Chain,
     actor: Actor,
-    trader_address: ShieldedAddress,
-    trader_pubkey: Address,
     shared: Arc<Shared>,
     trader: Sender<TraderJob>,
     pending: Vec<Pending>,
@@ -104,14 +117,13 @@ pub fn run(
     config: Config,
     spec: MakerSpec,
     view: MakerView,
-    trader_address: ShieldedAddress,
     shared: Arc<Shared>,
     jobs: Receiver<MakerJob>,
     trader: Sender<TraderJob>,
 ) {
     let name = spec.name;
     let mut maker = loop {
-        match Maker::boot(&config, &spec, &view, trader_address, &shared, &trader) {
+        match Maker::boot(&config, &spec, &view, &shared, &trader) {
             Ok(maker) => break maker,
             Err(error) => {
                 eprintln!("maker {name}: {error:#}; trying again");
@@ -125,19 +137,25 @@ pub fn run(
     loop {
         match jobs.recv_timeout(TICK) {
             Ok(MakerJob::Quote {
+                account,
+                market,
+                trader,
                 long,
                 size,
                 leverage,
             }) => {
-                if let Err(error) = maker.quote(long, size, leverage) {
+                if let Err(error) = maker.quote(&account, market, trader, long, size, leverage) {
                     eprintln!("maker {name}: no quote: {error:#}");
                     let _ = maker.trader.send(TraderJob::NoQuote {
+                        account,
                         maker: name.into(),
                         reason: format!("{error:#}"),
                     });
                 }
             }
+            Ok(MakerJob::Resend { account }) => maker.resend(&account),
             Ok(MakerJob::Opened {
+                account,
                 quote_id,
                 position_id,
                 position,
@@ -146,6 +164,7 @@ pub fn run(
                 maker.pending.retain(|pending| pending.id != quote_id);
                 maker.held.push(Held {
                     id: position_id,
+                    account,
                     position: *position,
                     leaf,
                 });
@@ -164,7 +183,6 @@ impl Maker {
         config: &Config,
         spec: &MakerSpec,
         view: &MakerView,
-        trader_address: ShieldedAddress,
         shared: &Arc<Shared>,
         trader: &Sender<TraderJob>,
     ) -> Result<Self> {
@@ -173,7 +191,7 @@ impl Maker {
         actor.sync(&chain)?;
         if actor.note(&chain, FLOAT_FLOOR).is_err() {
             let deployer: Keypair = solana_keypair(config, "devnet-deployer.json")?;
-            chain.shield(&deployer, &actor.keypair, FLOAT)?;
+            chain.shield(&deployer, &actor.keypair.shielded_address()?, FLOAT)?;
             actor.sync(&chain)?;
         }
         let mut maker = Self {
@@ -185,8 +203,6 @@ impl Maker {
                 coverage_tenths: spec.coverage_tenths,
             },
             view: view.clone(),
-            trader_pubkey: trader_address.solana_address()?,
-            trader_address,
             chain,
             actor,
             shared: Arc::clone(shared),
@@ -215,12 +231,14 @@ impl Maker {
         for found in positions {
             let id = id_of(&found.position_utxo.hash(self.chain.tree_id)?);
             let terms = &found.position_utxo.terms;
-            if terms.trader != self.trader_address {
+            let account = account_of(&found.position_utxo)?;
+            let Ok(market) = market_of(&terms.feed_id) else {
                 continue;
-            }
+            };
             let view = PositionView {
                 id: id.clone(),
                 frame: 0,
+                market: market.symbol.into(),
                 maker: self.view.clone(),
                 side: if terms.trader_is_long {
                     "long"
@@ -242,20 +260,16 @@ impl Maker {
                 settle_signature: None,
             };
             self.shared.update(|desk| {
-                if !desk.positions.iter().any(|position| position.id == id) {
-                    let frame = desk.positions.len() as u32 + 1;
-                    desk.positions.push(PositionView { frame, ..view });
+                let book = desk.book(&account);
+                if !book.positions.iter().any(|position| position.id == id) {
+                    let frame = book.positions.len() as u32 + 1;
+                    book.positions.push(PositionView { frame, ..view });
                 }
-            });
-            let _ = self.trader.send(TraderJob::Recovered {
-                position_id: id.clone(),
-                position: Box::new(found.position_utxo.clone()),
-                leaf: found.leaf_index,
-                maker: self.spec.index,
             });
             open.push(id.clone());
             self.held.push(Held {
                 id,
+                account,
                 position: found.position_utxo,
                 leaf: found.leaf_index,
             });
@@ -264,11 +278,13 @@ impl Maker {
         // settled while nobody was recording.
         let address = self.view.address.clone();
         self.shared.update(|desk| {
-            desk.positions.retain(|position| {
-                position.status != "open"
-                    || position.maker.address != address
-                    || open.contains(&position.id)
-            });
+            for book in desk.books.values_mut() {
+                book.positions.retain(|position| {
+                    position.status != "open"
+                        || position.maker.address != address
+                        || open.contains(&position.id)
+                });
+            }
         });
 
         let quotes = index_maker_quotes(
@@ -286,6 +302,7 @@ impl Maker {
             }
             self.pending.push(Pending {
                 id,
+                account: None,
                 quote: found.quote_utxo,
                 leaf: found.leaf_index,
                 // Most of these were opened long ago: one try each.
@@ -295,10 +312,32 @@ impl Maker {
         Ok(())
     }
 
-    /// Posts a quote for the trader at the oracle price, moved by this
-    /// maker's spread, and hands it to the trader to discover.
-    fn quote(&mut self, long: bool, size: u64, leverage: u64) -> Result<()> {
-        let mark = self.chain.oracle()?.price;
+    /// Tells `account`, which has just opened a session, about the positions
+    /// it has open against this maker.
+    fn resend(&self, account: &str) {
+        for held in self.held.iter().filter(|held| held.account == account) {
+            let _ = self.trader.send(TraderJob::Recovered {
+                account: account.into(),
+                position_id: held.id.clone(),
+                position: Box::new(held.position.clone()),
+                leaf: held.leaf,
+                maker: self.spec.index,
+            });
+        }
+    }
+
+    /// Posts a quote for `trader` at the oracle price, moved by this maker's
+    /// spread, and hands it to the trader's account to discover.
+    fn quote(
+        &mut self,
+        account: &str,
+        market: &Market,
+        trader: ShieldedAddress,
+        long: bool,
+        size: u64,
+        leverage: u64,
+    ) -> Result<()> {
+        let mark = self.chain.mark(market)?.price;
         let spread = mark / 10_000 * self.spec.spread_bps;
         let entry_price = if long { mark + spread } else { mark - spread };
         let notional = u64::try_from(size as u128 * entry_price as u128 / SIZE_SCALE as u128)?;
@@ -312,7 +351,7 @@ impl Maker {
         self.actor.sync(&self.chain)?;
         let source = self.actor.note(&self.chain, maker_margin)?;
         let terms = QuoteTerms {
-            feed_id: FEED_ID,
+            feed_id: market.feed,
             trader_is_long: long,
             size,
             entry_price,
@@ -320,13 +359,13 @@ impl Maker {
             maintenance_margin: trader_margin / 5,
             maker: self.actor.keypair.shielded_address()?,
             expiry: (now() + QUOTE_LIFETIME_SECS) as u64,
-            trader: Some(identity(&self.trader_pubkey)?),
+            trader: Some(identity(&trader.solana_address()?)?),
         };
         let transaction = QuoteTransactionParams {
             terms,
             maker_margin,
             source,
-            trader_address: self.trader_address,
+            trader_address: trader,
             payer: self.actor.pubkey,
         }
         .build(&self.actor.keypair)?;
@@ -341,7 +380,7 @@ impl Maker {
         let leaf = wait_for_merkle_proof(client.indexer(), self.chain.tree, hash).leaf_index;
         let id = id_of(&hash);
         self.shared.update(|desk| {
-            desk.log(
+            desk.book(account).log(
                 "quote",
                 &self.view.address,
                 None,
@@ -352,12 +391,14 @@ impl Maker {
         });
         self.pending.push(Pending {
             id,
+            account: Some(account.into()),
             quote: posted.clone(),
             leaf,
             attempts: 0,
         });
         self.trader
             .send(TraderJob::Discover {
+                account: account.into(),
                 posted: Box::new(posted),
                 maker: self.spec.index,
                 signature: signature.to_string(),
@@ -413,16 +454,18 @@ impl Maker {
             .instruction()?;
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
         self.chain.indexed(signature)?;
-        self.shared.update(|desk| {
-            desk.log(
-                "reclaim",
-                &self.view.address,
-                None,
-                None,
-                &["margin returned"],
-                &signature.to_string(),
-            );
-        });
+        if let Some(account) = &pending.account {
+            self.shared.update(|desk| {
+                desk.book(account).log(
+                    "reclaim",
+                    &self.view.address,
+                    None,
+                    None,
+                    &["margin returned"],
+                    &signature.to_string(),
+                );
+            });
+        }
         Ok(())
     }
 
@@ -431,40 +474,65 @@ impl Maker {
         if self.held.is_empty() {
             return;
         }
-        let Ok(price) = self.chain.settle_price() else {
-            return;
-        };
-        let due: Vec<usize> = (0..self.held.len())
-            .filter(|&index| self.held[index].position.is_liquidatable(price))
-            .collect();
-        for index in due.into_iter().rev() {
+        // One read of each market this maker has a position in.
+        let mut prices: Vec<(&'static Market, Mark)> = Vec::new();
+        let mut due = Vec::new();
+        for (index, held) in self.held.iter().enumerate() {
+            let Ok(market) = market_of(&held.position.terms.feed_id) else {
+                continue;
+            };
+            let known = prices
+                .iter()
+                .find(|(seen, _)| seen.symbol == market.symbol)
+                .map(|(_, mark)| *mark);
+            let mark = match known {
+                Some(mark) => mark,
+                None => {
+                    let Ok(mark) = self.chain.settle_mark(market) else {
+                        continue;
+                    };
+                    prices.push((market, mark));
+                    mark
+                }
+            };
+            if held.position.is_liquidatable(mark.price) {
+                due.push((index, market, mark));
+            }
+        }
+        for (index, market, mark) in due.into_iter().rev() {
             let id = self.held[index].id.clone();
+            let account = self.held[index].account.clone();
             // The trader may be closing it this very moment.
             let closing = {
-                let desk = self.shared.lock();
-                desk.busy
+                let mut desk = self.shared.lock();
+                desk.book(&account)
+                    .busy
                     .as_ref()
                     .is_some_and(|busy| busy.position_id.as_deref() == Some(id.as_str()))
             };
             if closing {
                 continue;
             }
-            match self.settle(index, price) {
+            match self.settle(index, market, mark) {
                 Ok(()) => {
                     self.held.remove(index);
-                    let _ = self.trader.send(TraderJob::Liquidated { position_id: id });
+                    let _ = self.trader.send(TraderJob::Liquidated {
+                        account,
+                        position_id: id,
+                    });
                 }
                 Err(error) => eprintln!("maker {}: liquidating {id}: {error:#}", self.spec.name),
             }
         }
     }
 
-    fn settle(&mut self, index: usize, price: u64) -> Result<()> {
+    fn settle(&mut self, index: usize, market: &Market, mark: Mark) -> Result<()> {
+        let price = mark.price;
         let held = &self.held[index];
         let transaction = SettleTransactionParams {
             position_utxo: held.position.clone(),
             position_leaf_index: held.leaf,
-            oracle: ORACLE,
+            oracle: mark.account,
             price,
             payer: self.actor.pubkey,
             tree_id: self.chain.tree_id,
@@ -477,8 +545,10 @@ impl Maker {
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
         self.chain.indexed(signature)?;
         let id = held.id.clone();
+        let account = held.account.clone();
         self.shared.update(|desk| {
-            if let Some(position) = desk.positions.iter_mut().find(|position| position.id == id) {
+            let book = desk.book(&account);
+            if let Some(position) = book.positions.iter_mut().find(|position| position.id == id) {
                 position.status = "liquidated".into();
                 position.settle_price = Some(price.to_string());
                 position.payout = Some(payout.to_string());
@@ -486,11 +556,11 @@ impl Maker {
                 position.settle_signature = Some(signature.to_string());
             }
             // A maker's settle names only the maker: the trader stays unnamed.
-            desk.log(
+            book.log(
                 "settle",
                 &self.view.address,
                 None,
-                Some(price),
+                Some((market.symbol, price)),
                 &["both payouts", "why it could settle"],
                 &signature.to_string(),
             );

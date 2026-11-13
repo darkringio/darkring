@@ -1,0 +1,20 @@
+# The devnet desk service behind app.darkring.io/api: the test wallets, the
+# prover and the transactions. Installed as /etc/systemd/system/darkring-desk.service:
+#   sudo cp /var/www/ring/deploy/darkring-desk.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now darkring-desk
+# Logs: journalctl -u darkring-desk -f (the Helius key is stripped by run-desk.sh).
+[Unit]
+Description=Darkring devnet desk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/var/www/ring
+Environment=HOME=/home/ubuntu
+ExecStart=/var/www/ring/scripts/run-desk.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

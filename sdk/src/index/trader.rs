@@ -5,7 +5,7 @@ use borsh::BorshDeserialize;
 use perps_program::circuits;
 use solana_address::Address;
 use spr_client::Rpc;
-use spr_keypair::{ShieldedAddress, ShieldedKeypair};
+use spr_keypair::ShieldedAddress;
 use spr_program::DataUtxo;
 use spr_transaction::{
     serialization::confidential::Confidential, AssetRegistry, DecodeCx, ShieldedTransaction,
@@ -18,6 +18,7 @@ use super::{
 };
 use crate::{
     err,
+    party::Party,
     shared::INDEXED_TREE_ID,
     state::{check_trader_identity, QuoteUtxo},
     QuoteMarkerData,
@@ -53,11 +54,12 @@ pub struct TraderQuoteCandidate {
 /// it does not decode. Only errors an attacker cannot produce propagate.
 pub fn scan_trader(
     tx: &ShieldedTransaction,
-    keypair: &ShieldedKeypair,
+    keypair: &impl Party,
     registry: &AssetRegistry,
 ) -> Result<Option<TraderQuoteCandidate>> {
     let trader_tag = keypair
-        .signing_pubkey()
+        .shielded_address()?
+        .signing_pubkey
         .confidential_view_tag()
         .map_err(err)?;
     Ok(tx
@@ -71,14 +73,14 @@ pub fn scan_trader(
 /// all attacker-controlled, does not decode.
 fn decode_candidate(
     tx: &ShieldedTransaction,
-    keypair: &ShieldedKeypair,
+    keypair: &impl Party,
     marker_data: &[u8],
     registry: &AssetRegistry,
 ) -> Option<TraderQuoteCandidate> {
     let marker = QuoteMarkerData::try_from_slice(marker_data).ok()?;
     let (slot_index, slot, body) = unified_slots(tx)
         .find(|(_, slot, _)| slot.output_context.hash == marker.quote_utxo_hash)?;
-    let cx = DecodeCx::for_slot(&keypair.viewing_key, tx, slot_index);
+    let cx = DecodeCx::for_slot(keypair.viewing_key(), tx, slot_index);
     let plaintext = Confidential::decode(&body, &cx).ok()?;
     let asset = resolve_mint(registry, plaintext.asset_id).ok()?;
     // The client writes the maker signer into the marker and the program
@@ -118,14 +120,15 @@ impl TraderQuoteCandidate {
 /// Finds the quotes addressed to `keypair`'s trader, by the view tag of its
 /// signing key, and checks each quote's maker against the user registry.
 pub fn index_trader_quotes<I: Rpc, R: Rpc>(
-    keypair: &ShieldedKeypair,
+    keypair: &impl Party,
     registry: &AssetRegistry,
     indexer: &I,
     rpc: &R,
     timeout: Duration,
 ) -> Result<Vec<TraderQuote>> {
     let owner_tag = keypair
-        .signing_pubkey()
+        .shielded_address()?
+        .signing_pubkey
         .confidential_view_tag()
         .map_err(err)?;
     index_until(timeout, "quotes for the trader", || {
