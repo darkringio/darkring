@@ -29,3 +29,7 @@ spr-user-registry-interface = { workspace = true, features = ["solana"] }
 [[test]]
 name = "perps"
 path = "tests/perps.rs"
+
+[[test]]
+name = "devnet"
+path = "tests/devnet.rs"
