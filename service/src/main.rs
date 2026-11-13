@@ -10,6 +10,7 @@
 //! their quotes to it.
 //!
 //!   GET  /api/state    the market, and the session's account
+//!   GET  /api/candles  ?market=SOL&interval=15, price history for the chart
 //!   POST /api/session  {"address","shielded":"<hex>","at":<ms>,"signature":"<hex>"}
 //!   POST /api/logout
 //!   POST /api/sign     {"id":7,"signature":"<hex>"}
@@ -31,6 +32,7 @@ mod desk;
 mod maker;
 mod opening;
 mod relay;
+mod tape;
 mod trader;
 
 use std::{
@@ -166,6 +168,7 @@ fn main() -> Result<()> {
             price: "0".into(),
             publish_time: 0,
             oracle: market.oracles[0].to_string(),
+            day: None,
         })
         .collect();
     desk.max_price_age = trader::max_price_age();
@@ -196,6 +199,11 @@ fn main() -> Result<()> {
         let (config, shared, makers) = (config.clone(), Arc::clone(&shared), maker_jobs.clone());
         let own = trader_jobs.clone();
         thread::spawn(move || trader::run(config, shared, trader_inbox, own, makers));
+    }
+
+    {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || tape::run(shared));
     }
 
     let listener = TcpListener::bind(("127.0.0.1", config.port))
@@ -325,6 +333,7 @@ fn serve(
     let request = Request {
         method,
         path: path.split('?').next().unwrap_or(""),
+        query: path.split_once('?').map_or("", |(_, query)| query),
         token: token.as_deref(),
         body: &body,
     };
@@ -350,6 +359,8 @@ fn serve(
 struct Request<'a> {
     method: &'a str,
     path: &'a str,
+    /// What follows the path's question mark, if anything.
+    query: &'a str,
     token: Option<&'a str>,
     body: &'a [u8],
 }
@@ -401,6 +412,24 @@ fn route(
     };
     if (request.method, request.path) == ("GET", "/api/state") {
         return Ok(shared.snapshot(session.as_ref().map(|(account, _)| account.as_str())));
+    }
+    // The chart's candles: market data, the same for everyone.
+    if (request.method, request.path) == ("GET", "/api/candles") {
+        let field = |name: &str| {
+            request
+                .query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value)
+        };
+        let market = field("market")
+            .and_then(market)
+            .ok_or_else(|| anyhow!("no such market"))?;
+        let interval = field("interval")
+            .and_then(|minutes| minutes.parse().ok())
+            .ok_or_else(|| anyhow!("no such interval"))?;
+        return Ok(tape::candles(market, interval)?.as_ref().clone());
     }
     if request.method != "POST" {
         bail!("no such route");

@@ -111,7 +111,7 @@ The [docs](https://darkring.io/docs) explain all of this for traders, with a wor
 | --- | --- |
 | [`program/`](program) | The Solana program and its four circuits: quote, open, settle and cancel quote. It verifies its own proof and hands the shielded transfer to the Rings pool. It stores no state. |
 | [`sdk/`](sdk) | Rust SDK. Builds and proves each transaction, and finds a trader's quotes and a maker's positions. |
-| [`service/`](service) | The devnet desk: three makers quoting eleven markets, and the HTTP API behind app.darkring.io. A trader's keys stay in the trader's browser, which proves its own trades; the service assembles and sends them. |
+| [`service/`](service) | The devnet desk: three makers quoting eleven markets, price history for the chart, and the HTTP API behind app.darkring.io. A trader's keys stay in the trader's browser, which proves its own trades; the service assembles and sends them. |
 | [`test/`](test) | End-to-end tests: `tests/perps.rs` against a local validator, `tests/devnet.rs` against devnet. |
 | [`scripts/`](scripts) | Tool setup, the devnet deploy, devnet wallets, the desk launcher and the browser package build. Each script's header says what it needs. |
 | [`deploy/`](deploy) | The systemd unit for the desk service. |

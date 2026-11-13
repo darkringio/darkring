@@ -49,6 +49,9 @@ pub struct MarketView {
     pub price: String,
     pub publish_time: i64,
     pub oracle: String,
+    /// The last 24 hours, in dollars: the price a day ago, the high and the
+    /// low. From the price history (`tape.rs`), not from the oracle.
+    pub day: Option<[f64; 3]>,
 }
 
 fn sol() -> String {
