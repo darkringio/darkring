@@ -82,7 +82,7 @@ sequenceDiagram
     D->>R: maker margin locked in a note only the trader can read
     T->>D: open, with a proof
     D->>R: both margins into one position note
-    Note over T,M: The position is open. Neither side can take money out alone.
+    Note over T,D: The position is open. Neither side can take money out alone.
     alt the trader closes, at any time
         T->>D: settle at the Pyth price
     else the trader's margin is down to maintenance
