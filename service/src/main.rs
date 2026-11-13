@@ -387,13 +387,23 @@ fn route(
             let market = market(&symbol).ok_or_else(|| anyhow!("no such market"))?;
             let amount = body.get("amount").and_then(Value::as_f64).unwrap_or(0.0);
             let leverage = body.get("leverage").and_then(Value::as_u64).unwrap_or(0);
-            let mark = shared
+            let (mark, published) = shared
                 .lock()
                 .markets
                 .iter()
                 .find(|view| view.symbol == symbol)
-                .and_then(|view| view.price.parse::<f64>().ok())
-                .unwrap_or(0.0);
+                .map(|view| (view.price.parse::<f64>().unwrap_or(0.0), view.publish_time))
+                .unwrap_or((0.0, 0));
+            // A position opened at a price too old to settle at could not be
+            // closed again until the price moves on.
+            let age = chain::now() - published;
+            if age > chain::SETTLE_PRICE_AGE_SECS {
+                bail!(
+                    "the {symbol} price has not updated for {} minutes, so {symbol} cannot be \
+                     traded until it does",
+                    age / 60
+                );
+            }
             let notional = amount * mark * 10f64.powi(market.expo);
             if !(amount > 0.0 && notional.is_finite() && notional <= MAX_NOTIONAL_USD)
                 || !(1..=50).contains(&leverage)
