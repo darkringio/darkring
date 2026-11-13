@@ -19,12 +19,11 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use perps_sdk::{
     index::{index_maker_positions, index_trader_quotes},
     instructions::{
-        open::OpenTransactionParams, quote::QuoteTransactionParams,
-        settle::SettleTransactionParams,
+        open::OpenTransactionParams, quote::QuoteTransactionParams, settle::SettleTransactionParams,
     },
     shared::identity,
     state::QuoteTerms,
-    OraclePrice, MAX_PRICE_AGE_SECS,
+    OraclePrice,
 };
 use solana_address::Address;
 use solana_instruction::Instruction;
@@ -64,6 +63,8 @@ const FEED_ID: [u8; 32] = [
     0xef, 0x0d, 0x8b, 0x6f, 0xda, 0x2c, 0xeb, 0xa4, 0x1d, 0xa1, 0x5d, 0x40, 0x95, 0xd1, 0xda, 0x39,
     0x2a, 0x0d, 0x2f, 0x8e, 0xd0, 0xc6, 0xc7, 0xbc, 0x0f, 0x4c, 0xfa, 0xc8, 0xc2, 0x80, 0xb5, 0x6d,
 ];
+/// The price window of the program as deployed to devnet.
+const DEVNET_MAX_PRICE_AGE_SECS: i64 = 600;
 const ORACLE: Address = Address::from_str_const("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE");
 
 fn var(name: &str) -> Result<String> {
@@ -111,19 +112,19 @@ fn oracle_price(rpc: &SolanaRpc) -> Result<OraclePrice> {
     OraclePrice::parse(&account.data).map_err(|e| anyhow!("oracle account: {e:?}"))
 }
 
-/// Waits for the oracle account's next update and returns it young enough
-/// that a settle proved now still lands inside the program's window.
+/// The oracle price, once a settle proved now would still land inside the
+/// devnet program's window.
 ///
-/// Pyth refreshes this account on devnet about every five minutes, and the
-/// program accepts a price for [`MAX_PRICE_AGE_SECS`], so a settle against
-/// it only lands in the minute after an update.
+/// Pyth refreshes this account on devnet about every five minutes. The
+/// devnet build of the program (its `devnet-oracle` feature) accepts a price
+/// for [`DEVNET_MAX_PRICE_AGE_SECS`], so this rarely waits.
 fn fresh_price(rpc: &SolanaRpc) -> Result<OraclePrice> {
     for _ in 0..240 {
         let price = oracle_price(rpc)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
-        if now - price.publish_time <= MAX_PRICE_AGE_SECS / 3 {
+        if now - price.publish_time <= DEVNET_MAX_PRICE_AGE_SECS - 40 {
             return Ok(price);
         }
         sleep(Duration::from_secs(2));
@@ -288,7 +289,10 @@ fn a_position_lives_on_devnet() -> Result<()> {
     .into_iter()
     .find(|quote| quote.quote_utxo == posted)
     .ok_or_else(|| anyhow!("the trader did not discover the quote"))?;
-    ensure!(quote.maker_pubkey == maker_pubkey, "wrong maker on the quote");
+    ensure!(
+        quote.maker_pubkey == maker_pubkey,
+        "wrong maker on the quote"
+    );
     wait_for_merkle_proof(client.indexer(), tree, quote.quote_utxo.hash(tree_id)?);
     sync_wallet(&mut trader, &trader_keypair, &client).map_err(|e| anyhow!("sync: {e:?}"))?;
     let trader_input = trader

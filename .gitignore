@@ -5,3 +5,5 @@ keys/
 test/test-ledger/
 # Local secrets, such as the Helius API key.
 .env
+# The desk service's record of positions and transactions.
+.desk/

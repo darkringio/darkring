@@ -10,7 +10,7 @@ use spr_transaction::{
 };
 
 use super::{
-    poll::{collect_tagged, collect_transactions, index_until},
+    poll::{collect_tagged, collect_transactions, index_until, spent_among},
     scan::{decode_quote, resolve_mint, resolve_registered, unified_slots},
 };
 use crate::{
@@ -135,8 +135,18 @@ pub fn index_maker_positions<I: Rpc, R: Rpc>(
                 registry,
             )
             .map_err(err)?;
+        let spent = spent_among(
+            indexer,
+            positions
+                .iter()
+                .map(|position| position.utxo.nullifier)
+                .collect(),
+        )?;
         let mut found = Vec::new();
         for position in positions {
+            if spent.contains(&position.utxo.nullifier) {
+                continue;
+            }
             let (_, trader_key, _) = position.data.trader.preimage();
             let Some(trader) = resolve_registered(rpc, Address::new_from_array(trader_key))? else {
                 continue;

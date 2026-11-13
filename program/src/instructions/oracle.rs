@@ -31,7 +31,15 @@ pub const ORACLE_PROGRAM_ID: Address =
 /// Whoever settles chooses the price update account, so within this window
 /// it can pick the update that suits it best. A shorter window narrows that
 /// choice; a longer one tolerates a slower oracle.
+#[cfg(not(feature = "devnet-oracle"))]
 pub const MAX_PRICE_AGE_SECS: i64 = 60;
+
+/// The devnet deployment's window. Pyth refreshes its sponsored devnet price
+/// accounts about every five minutes, so a one-minute window would leave a
+/// position closable for only a fifth of the time. Whoever settles still
+/// cannot choose among prices: the account holds one until its next update.
+#[cfg(feature = "devnet-oracle")]
+pub const MAX_PRICE_AGE_SECS: i64 = 600;
 
 const DISCRIMINATOR: [u8; 8] = [0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd];
 const VERIFICATION_LEVEL_OFFSET: usize = 8 + 32;

@@ -13,17 +13,22 @@
 #   DEPLOYER_KEYPAIR   default keys/devnet-deployer.json
 #   DEVNET_RPC_URL     default https://api.devnet.solana.com
 #
-# Build first:
-#   cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 \
-#       -- --locked --features bpf-entrypoint
+# Builds the devnet binary into target/deploy-devnet, apart from the one the
+# localnet tests load: it is the same program with the `devnet-oracle`
+# feature, which accepts an oracle price for ten minutes instead of one.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 solana="$root/.tools/agave/solana-release/bin/solana"
-program_so="$root/target/deploy/perps_program.so"
+program_so="$root/target/deploy-devnet/perps_program.so"
 program_keypair="$root/keys/perps_program-keypair.json"
 deployer="${DEPLOYER_KEYPAIR:-$root/keys/devnet-deployer.json}"
 rpc_url="${DEVNET_RPC_URL:-https://api.devnet.solana.com}"
+
+PATH="$root/.tools/agave/solana-release/bin:$HOME/.cargo/bin:$PATH" \
+    cargo build-sbf --manifest-path "$root/program/Cargo.toml" --tools-version v1.54 \
+    --sbf-out-dir "$root/target/deploy-devnet" \
+    -- --locked --features bpf-entrypoint,devnet-oracle
 
 for file in "$solana" "$program_so" "$program_keypair" "$deployer"; do
     if [[ ! -f $file ]]; then

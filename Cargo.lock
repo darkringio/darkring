@@ -3368,6 +3368,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "perps-desk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "perps-program",
+ "perps-sdk",
+ "serde",
+ "serde_json",
+ "solana-address 2.6.1",
+ "solana-instruction",
+ "solana-keypair",
+ "solana-signature",
+ "solana-signer",
+ "spr-client",
+ "spr-interface",
+ "spr-keypair",
+ "spr-program",
+ "spr-test-utils",
+ "spr-transaction",
+]
+
+[[package]]
 name = "perps-program"
 version = "0.1.0"
 dependencies = [

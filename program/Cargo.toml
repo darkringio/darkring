@@ -25,6 +25,10 @@ circuits = ["dep:xark", "spr-program/client"]
 # generated verifiers exist.
 build-circuits = ["circuits", "spr-program/build"]
 profile-program = ["light-program-profiler/profile-program"]
+# The devnet deployment only: accept an oracle price for ten minutes instead
+# of one. Pyth refreshes its sponsored devnet price accounts about every five
+# minutes, and posting a fresher price needs a paid Pyth API key.
+devnet-oracle = []
 
 [dependencies]
 xark = { workspace = true, optional = true }

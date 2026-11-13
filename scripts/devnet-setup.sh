@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Prepare devnet for the end-to-end run in test/tests/devnet.rs. Safe to run
-# again: every step is skipped once done.
+# Prepare devnet for the desk service and for the end-to-end run in
+# test/tests/devnet.rs. Safe to run again: every step is skipped once done.
 #
-#   1. A maker and a trader wallet in keys/, each given SOL for fees.
+#   1. A trader wallet and three maker wallets in keys/, each given SOL
+#      for fees.
 #   2. A 6-decimal test dollar whose mint authority is the deployer, with a
 #      million of it in the deployer's token account. The test registers the
-#      mint with the Rings pool and shields it to the two wallets.
+#      mint with the Rings pool; the service shields it to the wallets.
 #
 # Reads HELIUS_API_KEY from .env for the RPC, else uses the public endpoint.
 # Uses the project's own Solana CLI in .tools/agave.
@@ -34,7 +35,7 @@ token() { "$bin/spl-token" --url "$rpc_url" --fee-payer "$deployer" "$@"; }
 # What each wallet needs for fees and its user-registry record.
 wallet_lamports=300000000
 
-for name in maker trader; do
+for name in trader maker maker-2 maker-3; do
     file="$keys/devnet-$name.json"
     if [[ ! -f $file ]]; then
         "$bin/solana-keygen" new --no-bip39-passphrase --silent -o "$file" >/dev/null

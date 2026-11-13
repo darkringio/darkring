@@ -63,3 +63,37 @@ pub(crate) fn collect_transactions<I: Rpc>(
 ) -> Result<Vec<ShieldedTransaction>> {
     collect_tagged(tag, indexer, |tx| Ok(Some(tx.clone())))
 }
+
+/// Which of `nullifiers` a transaction has spent.
+///
+/// A program-owned UTXO is spent by a transaction that carries none of its
+/// owner's tags (a settle pays two wallets), so the scan by tag that found
+/// the UTXO never sees its spend; the indexer is asked by nullifier instead.
+pub(crate) fn spent_among<I: Rpc>(
+    indexer: &I,
+    nullifiers: Vec<[u8; 32]>,
+) -> Result<std::collections::HashSet<[u8; 32]>> {
+    let mut spent = std::collections::HashSet::new();
+    if nullifiers.is_empty() {
+        return Ok(spent);
+    }
+    let mut cursor = None;
+    loop {
+        let page = indexer
+            .get_shielded_transactions_by_nullifiers(
+                nullifiers.clone(),
+                cursor,
+                None,
+                HistoryFilters::default(),
+                None,
+            )
+            .map_err(err)?;
+        for tx in page.data.iter().flat_map(|group| &group.events) {
+            spent.extend(tx.nullifiers.iter().copied());
+        }
+        cursor = page.continuation(cursor).map_err(err)?;
+        if cursor.is_none() {
+            return Ok(spent);
+        }
+    }
+}
