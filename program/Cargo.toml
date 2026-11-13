@@ -24,6 +24,10 @@ circuits = ["dep:xark", "spr-program/client"]
 # Enabled only while `zolana zk compile` discovers the programs, before the
 # generated verifiers exist.
 build-circuits = ["circuits", "spr-program/build"]
+# The browser package `zolana zk compile --wasm-out` builds: the transaction
+# builders and state decoders for JavaScript. The CLI adds
+# `spr-program/wasm-prover`, Xark's prover, unless told `--no-prover`.
+wasm = ["circuits", "spr-program/wasm"]
 profile-program = ["light-program-profiler/profile-program"]
 # The devnet deployment only: accept an oracle price for ten minutes instead
 # of one. Pyth refreshes its sponsored devnet price accounts about every five
