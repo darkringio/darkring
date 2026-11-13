@@ -9,7 +9,7 @@ use spr_program::{
 };
 use xark_groth16::PkSource;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CircuitId {
     Quote,
     Open,
@@ -100,18 +100,53 @@ pub fn checked_circuit(id: CircuitId) -> Result<(tempfile::TempDir, xark::prover
     Ok((private, circuit))
 }
 
+/// A circuit checked and parsed once, with its verifying key and the private
+/// directory it proves from.
+struct Loaded {
+    _private: tempfile::TempDir,
+    circuit: xark::prover::Circuit,
+    key: SolanaVerifyingKey,
+}
+
+thread_local! {
+    /// The circuits this thread has proved with. Checking and parsing one
+    /// takes about as long as a proof, and a maker proves the same few over
+    /// and over. Each copy is private to this process, so what was checked
+    /// when it was loaded is what every later proof uses.
+    static LOADED: std::cell::RefCell<std::collections::HashMap<CircuitId, std::rc::Rc<Loaded>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn loaded(id: CircuitId) -> Result<std::rc::Rc<Loaded>> {
+    if let Some(found) = LOADED.with(|loaded| loaded.borrow().get(&id).cloned()) {
+        return Ok(found);
+    }
+    let key = verifying_key(id)?;
+    let (private, circuit) = checked_circuit(id)?;
+    let fresh = std::rc::Rc::new(Loaded {
+        _private: private,
+        circuit,
+        key,
+    });
+    LOADED.with(|loaded| loaded.borrow_mut().insert(id, std::rc::Rc::clone(&fresh)));
+    Ok(fresh)
+}
+
 /// Proves `inputs` with the checked circuit and checks the proof against the
 /// checked verifying key before returning it.
 pub fn prove(id: CircuitId, inputs: &ProgramProofInputs) -> Result<CompressedProof> {
-    let key = verifying_key(id)?;
-    let (_private, circuit) = checked_circuit(id)?;
-    let proven = circuit.prove(inputs.clone())?;
+    let loaded = loaded(id)?;
+    let proven = loaded.circuit.prove(inputs.clone())?;
     let proof = compressed_proof(&proven.proof).map_err(anyhow::Error::msg)?;
     let encoded = inputs.encoded();
     let hash = encoded.get("public_hash").context("missing public hash")?;
     let hash = spr_program::from_decimal(hash)?;
-    spr_program::verifier::verify_groth16(&proof, spr_program::to_bytes(&hash), &key.as_key())
-        .map_err(|error| anyhow::anyhow!("invalid perps proof: {error:?}"))?;
+    spr_program::verifier::verify_groth16(
+        &proof,
+        spr_program::to_bytes(&hash),
+        &loaded.key.as_key(),
+    )
+    .map_err(|error| anyhow::anyhow!("invalid perps proof: {error:?}"))?;
     Ok(proof)
 }
 

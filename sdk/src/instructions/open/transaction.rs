@@ -151,16 +151,10 @@ impl OpenTransactionParams {
 impl OpenTransaction {
     /// 1. Prove the SPP transaction with the authority and trader keys.
     /// 2. Prove the open circuit and build the instruction.
-    pub fn prove(
-        self,
-        indexer: &SprIndexer,
-        tree: Address,
-        trader: &impl Party,
-    ) -> Result<Open> {
+    pub fn prove(self, indexer: &SprIndexer, tree: Address, trader: &impl Party) -> Result<Open> {
         let payer = self.spp_proof_inputs.payer;
         // 1. Prove the SPP transaction.
-        let spp_proof =
-            prove_transact(
+        let spp_proof = prove_transact(
             indexer,
             self.spp_proof_inputs,
             &WithAuthorityInputs(trader.nullifier_key()),

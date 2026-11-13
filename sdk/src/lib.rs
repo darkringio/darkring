@@ -7,6 +7,7 @@ pub mod proof;
 pub mod shared;
 pub mod state;
 
+pub use party::{Party, ViewKeys};
 /// The program's wire types, which the instruction builders' fields name.
 pub use perps_program::{
     circuits::SIZE_SCALE,
@@ -19,7 +20,6 @@ pub use perps_program::{
     },
     maker_authority_seeds, tag, MAKER_AUTHORITY_PDA_SEED,
 };
-pub use party::{Party, ViewKeys};
 use solana_address::Address;
 use spr_program::ProgramOwner;
 

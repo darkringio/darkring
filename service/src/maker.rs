@@ -8,7 +8,7 @@ use std::{
         Arc,
     },
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -27,7 +27,9 @@ use spr_keypair::ShieldedAddress;
 use spr_test_utils::test_validator_asserts::wait_for_merkle_proof;
 
 use crate::{
-    chain::{market_of, now, now_ms, solana_keypair, Actor, Chain, Config, Mark, Market, USDC},
+    chain::{
+        market_of, now, now_ms, solana_keypair, Actor, Chain, Config, Laps, Mark, Market, USDC,
+    },
     desk::{MakerView, PositionView, Shared},
     trader::TraderJob,
 };
@@ -40,6 +42,9 @@ const FLOAT_FLOOR: u64 = 3_000 * USDC;
 const FLOAT: u64 = 20_000 * USDC;
 const TICK: Duration = Duration::from_secs(4);
 const CANCEL_ATTEMPTS: u8 = 3;
+/// A maker reads its notes again this long after it last did, so a quote
+/// does not have to wait for it.
+const NOTES_STALE: Duration = Duration::from_secs(20);
 
 pub struct MakerSpec {
     pub index: usize,
@@ -111,6 +116,10 @@ struct Maker {
     trader: Sender<TraderJob>,
     pending: Vec<Pending>,
     held: Vec<Held>,
+    /// When the maker last read its notes, and whether it has sent a
+    /// transaction of its own since: one that spent a note it still lists.
+    synced: Instant,
+    spent: bool,
 }
 
 pub fn run(
@@ -209,6 +218,8 @@ impl Maker {
             trader: trader.clone(),
             pending: Vec::new(),
             held: Vec::new(),
+            synced: Instant::now(),
+            spent: false,
         };
         maker.recover()?;
         Ok(maker)
@@ -348,8 +359,20 @@ impl Maker {
             "the size is too small"
         );
 
-        self.actor.sync(&self.chain)?;
-        let source = self.actor.note(&self.chain, maker_margin)?;
+        let mut lap = Laps::start();
+        // The notes are read between requests (`tick`), so a quote usually
+        // starts from a fresh list without waiting for one.
+        if self.spent || self.synced.elapsed() > NOTES_STALE {
+            self.refresh()?;
+        }
+        let source = match self.actor.note(&self.chain, maker_margin) {
+            Ok(source) => source,
+            Err(_) => {
+                self.refresh()?;
+                self.actor.note(&self.chain, maker_margin)?
+            }
+        };
+        lap.mark("notes");
         let terms = QuoteTerms {
             feed_id: market.feed,
             trader_is_long: long,
@@ -374,10 +397,16 @@ impl Maker {
         let instruction = transaction
             .prove(client.indexer(), self.chain.tree, &self.actor.keypair)?
             .instruction()?;
+        lap.mark("prove");
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
+        lap.mark("send");
         self.chain.indexed(signature)?;
+        lap.mark("indexed");
         let hash = posted.hash(self.chain.tree_id)?;
         let leaf = wait_for_merkle_proof(client.indexer(), self.chain.tree, hash).leaf_index;
+        lap.mark("leaf");
+        println!("maker {}: quoted in {lap}", self.spec.name);
+        self.spent = true;
         let id = id_of(&hash);
         self.shared.update(|desk| {
             desk.book(account).log(
@@ -410,6 +439,19 @@ impl Maker {
     fn tick(&mut self) {
         self.reclaim();
         self.liquidate();
+        if self.spent || self.synced.elapsed() > NOTES_STALE {
+            if let Err(error) = self.refresh() {
+                eprintln!("maker {}: reading notes: {error:#}", self.spec.name);
+            }
+        }
+    }
+
+    /// Reads the maker's notes from the indexer.
+    fn refresh(&mut self) -> Result<()> {
+        self.actor.sync(&self.chain)?;
+        self.synced = Instant::now();
+        self.spent = false;
+        Ok(())
     }
 
     /// Takes back the margin of quotes that expired unopened.
@@ -455,6 +497,7 @@ impl Maker {
             .instruction()?;
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
         self.chain.indexed(signature)?;
+        self.spent = true;
         if let Some(account) = &pending.account {
             self.shared.update(|desk| {
                 desk.book(account).log(
@@ -545,6 +588,7 @@ impl Maker {
             .instruction()?;
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
         self.chain.indexed(signature)?;
+        self.spent = true;
         let id = held.id.clone();
         let account = held.account.clone();
         self.shared.update(|desk| {

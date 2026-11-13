@@ -41,7 +41,7 @@ use spr_user_registry_interface::{
 };
 
 use crate::{
-    chain::{market_of, now_ms, solana_keypair, Chain, Config, MAX_PRICE_AGE_SECS, USDC},
+    chain::{market_of, now_ms, solana_keypair, Chain, Config, Laps, MAX_PRICE_AGE_SECS, USDC},
     desk::{PositionView, QuoteView, Shared},
     maker::{id_of, MakerJob},
     opening::opening,
@@ -103,6 +103,16 @@ pub enum TraderJob {
     Faucet {
         account: String,
     },
+    /// An open has landed: find the position's leaf in the tree, which the
+    /// account's browser needs to close it and its maker to settle it.
+    Located {
+        account: String,
+        quote_id: String,
+        position_id: String,
+        position: Box<PositionUtxo>,
+        maker: usize,
+        signature: Signature,
+    },
     /// A maker settled this position.
     Liquidated {
         account: String,
@@ -127,6 +137,7 @@ impl TraderJob {
             | Self::Open { account, .. }
             | Self::Close { account, .. }
             | Self::Faucet { account }
+            | Self::Located { account, .. }
             | Self::Liquidated { account, .. }
             | Self::Recovered { account, .. } => account,
         }
@@ -184,7 +195,6 @@ impl Signer for BrowserSigner {
 
 struct Position {
     utxo: PositionUtxo,
-    leaf: u64,
     maker: usize,
 }
 
@@ -207,6 +217,8 @@ struct Trader {
     deployer: Keypair,
     shared: Arc<Shared>,
     makers: Vec<Sender<MakerJob>>,
+    /// This thread's own queue, for work that follows an action.
+    own: Sender<TraderJob>,
     seats: HashMap<String, Seat>,
     /// When the desk last paid an account's fees, for the hourly limit.
     grants: Vec<Instant>,
@@ -218,10 +230,11 @@ pub fn run(
     config: Config,
     shared: Arc<Shared>,
     jobs: Receiver<TraderJob>,
+    own: Sender<TraderJob>,
     makers: Vec<Sender<MakerJob>>,
 ) {
     let mut trader = loop {
-        match Trader::boot(&config, &shared, &makers) {
+        match Trader::boot(&config, &shared, &own, &makers) {
             Ok(trader) => break trader,
             Err(error) => {
                 eprintln!("trader: {error:#}; trying again");
@@ -262,7 +275,12 @@ pub fn run(
 }
 
 impl Trader {
-    fn boot(config: &Config, shared: &Arc<Shared>, makers: &[Sender<MakerJob>]) -> Result<Self> {
+    fn boot(
+        config: &Config,
+        shared: &Arc<Shared>,
+        own: &Sender<TraderJob>,
+        makers: &[Sender<MakerJob>],
+    ) -> Result<Self> {
         let chain = Chain::connect(config)?;
         let deployer = solana_keypair(config, "devnet-deployer.json")?;
         let mut trader = Self {
@@ -270,6 +288,7 @@ impl Trader {
             deployer,
             shared: Arc::clone(shared),
             makers: makers.to_vec(),
+            own: own.clone(),
             seats: HashMap::new(),
             grants: Vec::new(),
             ticked: Instant::now(),
@@ -343,6 +362,40 @@ impl Trader {
             TraderJob::Faucet { account } => {
                 self.with_seat(&account, |trader, seat| trader.faucet(seat))
             }
+            TraderJob::Located {
+                account,
+                quote_id,
+                position_id,
+                position,
+                maker,
+                signature,
+            } => {
+                self.chain.indexed(signature)?;
+                let hash = position.hash(self.chain.tree_id)?;
+                let client = &self.chain.client;
+                let leaf =
+                    wait_for_merkle_proof(client.indexer(), self.chain.tree, hash).leaf_index;
+                // The account may have left meanwhile: its maker still has
+                // to know, and hands the opening back on the next session.
+                if self.seats.contains_key(&account) {
+                    let input = position.to_input_utxo(self.chain.tree_id, leaf)?;
+                    self.shared
+                        .lock()
+                        .book(&account)
+                        .openings
+                        .insert(position_id.clone(), opening(&input, &position.terms.maker));
+                }
+                if let Some(sender) = self.makers.get(maker) {
+                    let _ = sender.send(MakerJob::Opened {
+                        account,
+                        quote_id,
+                        position_id,
+                        position,
+                        leaf,
+                    });
+                }
+                Ok(())
+            }
             TraderJob::Liquidated {
                 account,
                 position_id,
@@ -377,7 +430,6 @@ impl Trader {
                     position_id,
                     Position {
                         utxo: *position,
-                        leaf,
                         maker,
                     },
                 );
@@ -621,30 +673,20 @@ impl Trader {
         }
         .instruction()?;
         self.shared.label(&seat.account, "Sending to Solana");
+        let mut lap = Laps::start();
         let signature = self.chain.send(&seat.signer, instruction)?;
-        self.chain.indexed(signature)?;
-        let hash = opened.hash(self.chain.tree_id)?;
-        let client = &self.chain.client;
-        let leaf = wait_for_merkle_proof(client.indexer(), self.chain.tree, hash).leaf_index;
-        let id = id_of(&hash);
-        let input = opened.to_input_utxo(self.chain.tree_id, leaf)?;
+        lap.mark("sign and send");
+        println!("trader: open sent in {lap}");
+        // The position is open from here. Where it sits in the tree is
+        // looked up next (`Located`), without keeping the trader waiting.
+        let id = id_of(&opened.hash(self.chain.tree_id)?);
 
         self.shared.update(|desk| {
             desk.closed_quotes.push(quote_id.into());
             let book = desk.book(&seat.account);
             book.quotes.clear();
-            book.openings.clear();
-            for (held, position) in &seat.positions {
-                if let Ok(input) = position
-                    .utxo
-                    .to_input_utxo(self.chain.tree_id, position.leaf)
-                {
-                    book.openings
-                        .insert(held.clone(), opening(&input, &position.utxo.terms.maker));
-                }
-            }
             book.openings
-                .insert(id.clone(), opening(&input, &opened.terms.maker));
+                .retain(|held, _| seat.positions.contains_key(held));
             let frame = book.positions.len() as u32 + 1;
             book.positions.push(PositionView {
                 id: id.clone(),
@@ -681,20 +723,18 @@ impl Trader {
             );
         });
         seat.quotes.clear();
-        if let Some(sender) = self.makers.get(maker) {
-            let _ = sender.send(MakerJob::Opened {
-                account: seat.account.clone(),
-                quote_id: quote_id.into(),
-                position_id: id.clone(),
-                position: Box::new(opened.clone()),
-                leaf,
-            });
-        }
+        let _ = self.own.send(TraderJob::Located {
+            account: seat.account.clone(),
+            quote_id: quote_id.into(),
+            position_id: id.clone(),
+            position: Box::new(opened.clone()),
+            maker,
+            signature,
+        });
         seat.positions.insert(
             id,
             Position {
                 utxo: opened,
-                leaf,
                 maker,
             },
         );
@@ -743,8 +783,10 @@ impl Trader {
         }
         .instruction()?;
         self.shared.label(&seat.account, "Sending to Solana");
+        let mut lap = Laps::start();
         let signature = self.chain.send(&seat.signer, instruction)?;
-        self.chain.indexed(signature)?;
+        lap.mark("sign and send");
+        println!("trader: close sent in {lap}");
 
         self.shared.update(|desk| {
             let book = desk.book(&seat.account);

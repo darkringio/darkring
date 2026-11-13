@@ -463,3 +463,41 @@ impl Actor {
             })
     }
 }
+
+/// How long each step of one action took, for the log: `4.2s (sync 0.9,
+/// prove 1.4, send 1.9)`.
+pub struct Laps {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    laps: Vec<(&'static str, f32)>,
+}
+
+impl Laps {
+    pub fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            last: now,
+            laps: Vec::new(),
+        }
+    }
+
+    /// Ends the step called `name`.
+    pub fn mark(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        self.laps
+            .push((name, now.duration_since(self.last).as_secs_f32()));
+        self.last = now;
+    }
+}
+
+impl std::fmt::Display for Laps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.1}s (", self.started.elapsed().as_secs_f32())?;
+        for (index, (name, seconds)) in self.laps.iter().enumerate() {
+            let comma = if index == 0 { "" } else { ", " };
+            write!(f, "{comma}{name} {seconds:.1}")?;
+        }
+        f.write_str(")")
+    }
+}

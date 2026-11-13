@@ -13,7 +13,7 @@
 //!   POST /api/session  {"address","shielded":"<hex>","at":<ms>,"signature":"<hex>"}
 //!   POST /api/logout
 //!   POST /api/sign     {"id":7,"signature":"<hex>"}
-//!   POST /api/quotes   {"market":"BTC","side":"long","amount":0.01,"leverage":8}
+//!   POST /api/quotes   {"market":"BTC","side":"long","amount":0.01,"leverage":8,"take":false}
 //!   POST /api/open     {"quoteId","proof":"<hex>","transact":"<hex>"}
 //!   POST /api/close    {"positionId","oracle","price","proof":"<hex>","transact":"<hex>"}
 //!   POST /api/faucet   shield another 5,000 test dollars to the account
@@ -73,6 +73,14 @@ const SESSION_SKEW_MS: u64 = 5 * 60 * 1000;
 /// The largest body the API reads, and the largest it relays to Helius.
 const MAX_BODY: usize = 64 * 1024;
 const MAX_RELAY_BODY: usize = 1024 * 1024;
+
+/// The maker a market order opens with: the tightest spread, then the
+/// higher profit cap. The web app's ticket shows the same maker's numbers.
+fn best_maker() -> usize {
+    (0..MAKERS.len())
+        .min_by_key(|&index| (MAKERS[index].2, u64::MAX - MAKERS[index].3))
+        .unwrap_or(0)
+}
 
 /// The most a position may be worth at entry, in dollars: a bound on what
 /// the desk will try to quote, far above what a test balance can open.
@@ -186,7 +194,8 @@ fn main() -> Result<()> {
     }
     {
         let (config, shared, makers) = (config.clone(), Arc::clone(&shared), maker_jobs.clone());
-        thread::spawn(move || trader::run(config, shared, trader_inbox, makers));
+        let own = trader_jobs.clone();
+        thread::spawn(move || trader::run(config, shared, trader_inbox, own, makers));
     }
 
     let listener = TcpListener::bind(("127.0.0.1", config.port))
@@ -529,14 +538,30 @@ fn route(
                 bail!("size out of range");
             }
             let size = size as u64;
-            begin(Busy::new("quotes", "Asking three makers"))?;
+            // A market order goes to the maker with the best price alone:
+            // the others would quote further from the mark, and each quote
+            // is a transaction that locks a maker's margin.
+            let take = body.get("take").and_then(Value::as_bool).unwrap_or(false);
+            let asked: Vec<&mpsc::Sender<MakerJob>> = if take {
+                makers.get(best_maker()).into_iter().collect()
+            } else {
+                makers.iter().collect()
+            };
+            begin(Busy::new(
+                "quotes",
+                if take {
+                    "Asking for the best price"
+                } else {
+                    "Asking three makers"
+                },
+            ))?;
             {
                 let mut desk = shared.lock();
                 let book = desk.book(account);
                 book.quotes.clear();
-                book.awaiting_quotes = makers.len();
+                book.awaiting_quotes = asked.len();
             }
-            for maker in makers {
+            for maker in asked {
                 maker
                     .send(MakerJob::Quote {
                         account: account.into(),
