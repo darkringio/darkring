@@ -246,8 +246,9 @@ pub struct Chain {
     pub client: SprClient<SolanaRpc>,
     pub tree: Address,
     pub tree_id: u16,
-    /// The test dollar.
+    /// The test dollar, and the id the pool knows it by.
     pub mint: Address,
+    pub asset_id: u64,
     pub assets: AssetRegistry,
 }
 
@@ -276,6 +277,7 @@ impl Chain {
             tree,
             tree_id,
             mint,
+            asset_id,
             assets,
         })
     }

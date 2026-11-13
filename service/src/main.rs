@@ -1,30 +1,36 @@
 //! The devnet desk. Runs three maker wallets, each on a thread of its own
 //! against devnet, and serves the web app a small JSON API on localhost.
 //!
-//! Traders bring their own account. A browser derives the account's keys
-//! from a wallet signature, keeps the key that signs, and opens a session
-//! here with the seed of the other two: enough for this process to read the
-//! account's notes and to build and prove its transactions, which it sends
-//! back for the browser to sign. The seed is held in memory only, until the
-//! session ends.
+//! Traders bring their own account, and its keys stay in their browser. The
+//! browser reads the account's notes, builds each open and close and proves
+//! it; this process is handed the finished proofs, assembles the program's
+//! instruction, and sends the transaction back for the browser to sign. A
+//! session is opened by a signature of the account's key, and tells this
+//! process the account's shielded address, which is public: makers encrypt
+//! their quotes to it.
 //!
 //!   GET  /api/state    the market, and the session's account
-//!   POST /api/session  {"address":"...","seed":"<hex>"}, answers a token
+//!   POST /api/session  {"address","shielded":"<hex>","at":<ms>,"signature":"<hex>"}
 //!   POST /api/logout
 //!   POST /api/sign     {"id":7,"signature":"<hex>"}
 //!   POST /api/quotes   {"market":"BTC","side":"long","amount":0.01,"leverage":8}
-//!   POST /api/open     {"quoteId":"..."}
-//!   POST /api/close    {"positionId":"..."}
+//!   POST /api/open     {"quoteId","proof":"<hex>","transact":"<hex>"}
+//!   POST /api/close    {"positionId","oracle","price","proof":"<hex>","transact":"<hex>"}
 //!   POST /api/faucet   shield another 5,000 test dollars to the account
+//!   any  /api/rings…   the Rings indexer and enclave prover at Helius
+//!   POST /api/rpc      a Solana node, for reads
 //!
 //! Everything but the first two needs `Authorization: Bearer <token>`.
 //!
 //! Needs HELIUS_API_KEY (or DEVNET_RPC_URL and DEVNET_SPR_URL), ZOLANA_CLI_BIN
-//! for the local prover, and the wallets scripts/devnet-setup.sh makes.
+//! for the local prover the makers use, and the wallets
+//! scripts/devnet-setup.sh makes.
 
 mod chain;
 mod desk;
 mod maker;
+mod opening;
+mod relay;
 mod trader;
 
 use std::{
@@ -40,15 +46,16 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use perps_sdk::OpenProof;
 use serde_json::{json, Value};
 use solana_address::Address;
 use spr_client::ProverLaunch;
-use spr_keypair::{ShieldedKeypair, SigningKey};
-use spr_test_utils::wallet::{ClientEd25519WalletAuthority, SyncWalletAuthority};
+use spr_interface::instruction::instruction_data::transact::TransactIxData;
+use spr_keypair::{PublicKey, ShieldedAddress, ShieldedKeypair, SigningKey};
 
 use crate::{
     chain::{market, markets, Config},
-    desk::{hex, unhex, Busy, Desk, MakerView, MarketView, Shared},
+    desk::{hex, unhex, unhex_vec, Busy, Desk, MakerView, MarketView, Shared},
     maker::{MakerJob, MakerSpec},
     trader::TraderJob,
 };
@@ -60,6 +67,12 @@ const MAKERS: [(&str, &str, u64, u64); 3] = [
     ("Selwyn", "devnet-maker-2.json", 3, 10),
     ("Amory", "devnet-maker-3.json", 9, 30),
 ];
+
+/// How far a session request's clock may be from this machine's.
+const SESSION_SKEW_MS: u64 = 5 * 60 * 1000;
+/// The largest body the API reads, and the largest it relays to Helius.
+const MAX_BODY: usize = 64 * 1024;
+const MAX_RELAY_BODY: usize = 1024 * 1024;
 
 /// The most a position may be worth at entry, in dollars: a bound on what
 /// the desk will try to quote, far above what a test balance can open.
@@ -81,7 +94,9 @@ fn config() -> Result<Config> {
             .ok()
             .or_else(|| from_key("v1/spr"))
             .ok_or_else(|| anyhow!("set HELIUS_API_KEY or DEVNET_SPR_URL"))?,
-        keys_dir: root.join("keys"),
+        keys_dir: env::var_os("DESK_KEYS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("keys")),
         state_file: env::var_os("DESK_STATE_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join(".desk/accounts.json")),
@@ -109,8 +124,9 @@ fn shielded(config: &Config, file: &str) -> Result<ShieldedKeypair> {
 fn main() -> Result<()> {
     let config = config()?;
 
-    // The pool proofs are made on this machine, by the release prover with
-    // the release keys: no witness leaves it.
+    // The makers' pool proofs are made on this machine, by the release
+    // prover with the release keys. A trader's are made by Helius's enclave
+    // prover, which the trader's browser reaches through `relay`.
     let home = env::var("HOME").context("HOME is not set")?;
     ProverLaunch::new_with_cli(env::var("ZOLANA_CLI_BIN").context("ZOLANA_CLI_BIN is not set")?)?
         .with_keys_dir(Path::new(&home).join(".config/zolana/proving-keys"))?
@@ -137,6 +153,7 @@ fn main() -> Result<()> {
         .map(|market| MarketView {
             symbol: market.symbol.into(),
             name: market.name.into(),
+            feed: hex(&market.feed),
             expo: market.expo,
             price: "0".into(),
             publish_time: 0,
@@ -178,8 +195,9 @@ fn main() -> Result<()> {
     for stream in listener.incoming().flatten() {
         let (shared, trader_jobs, maker_jobs) =
             (Arc::clone(&shared), trader_jobs.clone(), maker_jobs.clone());
+        let config = config.clone();
         thread::spawn(move || {
-            if let Err(error) = serve(stream, &shared, &trader_jobs, &maker_jobs) {
+            if let Err(error) = serve(stream, &config, &shared, &trader_jobs, &maker_jobs) {
                 eprintln!("desk: request: {error:#}");
             }
         });
@@ -207,6 +225,7 @@ impl std::error::Error for NoSession {}
 /// Answers one HTTP request and closes the connection.
 fn serve(
     mut stream: TcpStream,
+    config: &Config,
     shared: &Shared,
     trader: &mpsc::Sender<TraderJob>,
     makers: &[mpsc::Sender<MakerJob>],
@@ -219,6 +238,7 @@ fn serve(
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let mut length = 0usize;
     let mut token = None;
+    let mut headers = Vec::new();
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header)? == 0 || header.trim().is_empty() {
@@ -230,10 +250,68 @@ fn serve(
             } else if name.eq_ignore_ascii_case("authorization") {
                 token = value.trim().strip_prefix("Bearer ").map(str::to_owned);
             }
+            headers.push((name.trim().to_owned(), value.trim().to_owned()));
         }
     }
-    let mut body = vec![0; length.min(64 * 1024)];
+    let relayed = path
+        .strip_prefix("/api")
+        .filter(|rest| rest.starts_with("/rings") || rest.starts_with("/rpc"));
+    let limit = if relayed.is_some() {
+        MAX_RELAY_BODY
+    } else {
+        MAX_BODY
+    };
+    if length > limit {
+        write!(
+            stream,
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )?;
+        return Ok(());
+    }
+    let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
+
+    // A request for Helius, from a browser with a session: passed on with
+    // the desk's key, and answered with whatever Helius said.
+    if let Some(target) = relayed {
+        let known = token
+            .as_deref()
+            .is_some_and(|token| shared.lock().session(token).is_some());
+        let answer = if known {
+            relay::relay(config, method, target, &headers, body)
+        } else {
+            Err(NoSession.into())
+        };
+        return match answer {
+            Ok(answer) => {
+                write!(stream, "HTTP/1.1 {} Relayed\r\n", answer.status)?;
+                for (name, value) in &answer.headers {
+                    write!(stream, "{name}: {value}\r\n")?;
+                }
+                write!(
+                    stream,
+                    "Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                    answer.body.len()
+                )?;
+                stream.write_all(&answer.body)?;
+                Ok(())
+            }
+            Err(error) => {
+                let status = if error.is::<NoSession>() {
+                    "401 Unauthorized"
+                } else {
+                    "502 Bad Gateway"
+                };
+                let payload = json!({ "error": format!("{error:#}") }).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )?;
+                Ok(())
+            }
+        };
+    }
 
     let request = Request {
         method,
@@ -265,6 +343,31 @@ struct Request<'a> {
     path: &'a str,
     token: Option<&'a str>,
     body: &'a [u8],
+}
+
+/// What an account's key signs to open a session: its address, its
+/// shielded address in hex, and the time in unix milliseconds.
+fn session_message(address: &str, shielded: &str, at: u64) -> String {
+    format!("darkring session\n{address}\n{shielded}\n{at}")
+}
+
+/// A program proof and the pool's transact data, as a browser sends them:
+/// the proof's three points one after another, and the transact data in the
+/// encoding the pool reads, both in hex. Both are public once they land.
+fn proofs(proof: &str, transact: &str) -> Result<(OpenProof, TransactIxData)> {
+    let bytes: [u8; 128] = unhex(proof).ok_or_else(|| anyhow!("proof is not 128 bytes of hex"))?;
+    let mut proof = OpenProof {
+        a: [0; 32],
+        b: [0; 64],
+        c: [0; 32],
+    };
+    proof.a.copy_from_slice(&bytes[..32]);
+    proof.b.copy_from_slice(&bytes[32..96]);
+    proof.c.copy_from_slice(&bytes[96..]);
+    let bytes = unhex_vec(transact).ok_or_else(|| anyhow!("transact is not hex"))?;
+    let transact = wincode::deserialize_exact::<TransactIxData>(&bytes)
+        .map_err(|_| anyhow!("transact is not the pool's transact data"))?;
+    Ok((proof, transact))
 }
 
 /// A session token: 32 bytes from the system's generator, in hex.
@@ -311,15 +414,27 @@ fn route(
         }
         let address = Address::from_str(&text("address")?)
             .map_err(|_| anyhow!("address is not a Solana address"))?;
-        let seed: [u8; 64] =
-            unhex(&text("seed")?).ok_or_else(|| anyhow!("seed is not 64 bytes of hex"))?;
-        // The seed is the account's own signature over the derivation
-        // message: only the account's key could have made it.
-        let authority = ClientEd25519WalletAuthority::from_derivation_seed(address, &seed)
-            .map_err(|_| anyhow!("the seed is not this account's"))?;
-        let shielded = authority
-            .shielded_address()
-            .map_err(|e| anyhow!("account address: {e:?}"))?;
+        let shielded_hex = text("shielded")?;
+        let at = body
+            .get("at")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("missing at"))?;
+        let signature: [u8; 64] = unhex(&text("signature")?)
+            .ok_or_else(|| anyhow!("signature is not 64 bytes of hex"))?;
+        // Only the account's key could have signed this, and only just now.
+        if chain::now_ms().abs_diff(at) > SESSION_SKEW_MS {
+            bail!("this device's clock is off by more than five minutes");
+        }
+        let message = session_message(&address.to_string(), &shielded_hex, at);
+        if !PublicKey::from_ed25519(address.as_array())
+            .verify_message(message.as_bytes(), &signature)
+        {
+            bail!("the signature is not this account's");
+        }
+        let shielded = unhex(&shielded_hex)
+            .and_then(|bytes| ShieldedAddress::from_bytes(&bytes).ok())
+            .filter(|shielded| shielded.solana_address().ok() == Some(address))
+            .ok_or_else(|| anyhow!("shielded is not this account's address"))?;
         let account = address.to_string();
         let token = new_token()?;
         {
@@ -333,7 +448,7 @@ fn route(
                 trader
                     .send(TraderJob::Login {
                         account: account.clone(),
-                        authority: Box::new(authority),
+                        address: Box::new(shielded),
                     })
                     .map_err(gone)?;
             }
@@ -346,8 +461,7 @@ fn route(
     let (account, address) = session.ok_or(NoSession)?;
     let account = account.as_str();
 
-    // One action at a time for each account: each is a proof and a
-    // transaction.
+    // One action at a time for each account: each is a transaction.
     let begin = |busy: Busy| -> Result<()> {
         let mut desk = shared.lock();
         let book = desk.book(account);
@@ -415,19 +529,12 @@ fn route(
                 bail!("size out of range");
             }
             let size = size as u64;
-            // `take` makes it a market order: the desk opens the best quote
-            // itself once every maker has answered.
-            let take = body.get("take").and_then(Value::as_bool).unwrap_or(false);
-            begin(Busy::new(
-                if take { "take" } else { "quotes" },
-                "Asking three makers",
-            ))?;
+            begin(Busy::new("quotes", "Asking three makers"))?;
             {
                 let mut desk = shared.lock();
                 let book = desk.book(account);
                 book.quotes.clear();
                 book.awaiting_quotes = makers.len();
-                book.take = take.then_some(mark as u64);
             }
             for maker in makers {
                 maker
@@ -444,27 +551,40 @@ fn route(
         }
         "/api/open" => {
             let quote_id = text("quoteId")?;
+            let (proof, transact) = proofs(&text("proof")?, &text("transact")?)?;
             begin(Busy {
                 quote_id: Some(quote_id.clone()),
-                ..Busy::new("open", "Proving the open")
+                ..Busy::new("open", "Sending to Solana")
             })?;
             trader
                 .send(TraderJob::Open {
                     account: account.into(),
                     quote_id,
+                    proof: Box::new(proof),
+                    transact: Box::new(transact),
                 })
                 .map_err(gone)?;
         }
         "/api/close" => {
             let position_id = text("positionId")?;
+            let oracle = Address::from_str(&text("oracle")?)
+                .map_err(|_| anyhow!("oracle is not a Solana address"))?;
+            let price = text("price")?
+                .parse::<u64>()
+                .map_err(|_| anyhow!("price is not a number of ticks"))?;
+            let (proof, transact) = proofs(&text("proof")?, &text("transact")?)?;
             begin(Busy {
                 position_id: Some(position_id.clone()),
-                ..Busy::new("close", "Proving the close")
+                ..Busy::new("close", "Sending to Solana")
             })?;
             trader
                 .send(TraderJob::Close {
                     account: account.into(),
                     position_id,
+                    oracle,
+                    price,
+                    proof: Box::new(proof),
+                    transact: Box::new(transact),
                 })
                 .map_err(gone)?;
         }

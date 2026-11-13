@@ -111,9 +111,9 @@ The [docs](https://darkring.io/docs) explain all of this for traders, with a wor
 | --- | --- |
 | [`program/`](program) | The Solana program and its four circuits: quote, open, settle and cancel quote. It verifies its own proof and hands the shielded transfer to the Rings pool. It stores no state. |
 | [`sdk/`](sdk) | Rust SDK. Builds and proves each transaction, and finds a trader's quotes and a maker's positions. |
-| [`service/`](service) | The devnet desk: three makers quoting eleven markets, and the HTTP API behind app.darkring.io. Traders sign in their browser; the service never holds a key that can sign for them. |
+| [`service/`](service) | The devnet desk: three makers quoting eleven markets, and the HTTP API behind app.darkring.io. A trader's keys stay in the trader's browser, which proves its own trades; the service assembles and sends them. |
 | [`test/`](test) | End-to-end tests: `tests/perps.rs` against a local validator, `tests/devnet.rs` against devnet. |
-| [`scripts/`](scripts) | Tool setup, the devnet deploy, devnet wallets and the desk launcher. Each script's header says what it needs. |
+| [`scripts/`](scripts) | Tool setup, the devnet deploy, devnet wallets, the desk launcher and the browser package build. Each script's header says what it needs. |
 | [`deploy/`](deploy) | The systemd unit for the desk service. |
 | [`docs/reference/`](docs/reference) | The design of the Rings swap example this program grew out of. |
 
@@ -158,11 +158,16 @@ scripts/run-desk.sh
 
 This starts the desk service on `127.0.0.1:5374`. It needs a `.env` with `HELIUS_API_KEY` and the devnet wallets in `keys/`. Neither is in this repository.
 
-A trader's wallet signs one message, and the browser derives a separate trading account from that signature. The service builds and proves each transaction with view keys it holds in memory for the session, then hands the transaction back to the browser to sign. So the service can see a connected account's balance and positions, and cannot move its funds.
+A trader's wallet signs one message, and the browser derives a separate trading account from that signature. Every key of that account stays in the browser. The browser reads its own balance, and builds and proves each open and close itself:
+
+- **The program's proof** is made in the browser, with the program's own Rust compiled to WebAssembly. `scripts/build-web-package.sh` builds that package from the compiled circuits.
+- **The Rings pool's proof** has no browser prover yet, so it is made by Helius's prover, which runs in an enclave. The browser attests the enclave and encrypts the request to it. The service relays the ciphertext and cannot read it.
+
+The service is handed the two finished proofs, puts them in the program's instruction, sends the transaction back to the browser to sign, and sends it to Solana. It cannot see a trader's balance and cannot move its funds. It does know every position opened on this desk, because the three makers are its own, and a maker always knows the position it takes the other side of.
 
 ## Not built yet
 
-- **Proving in the browser.** Today the desk service builds the proofs, which is why it can see connected accounts' positions.
+- **Both proofs in the browser.** The program's proof is made in the trader's browser. The Rings pool's proof is made in Helius's enclave, which the trader has to trust with the notes that trade spends and creates.
 - **Deposits and withdrawals of your own tokens.** Accounts are funded with test dollars from a faucet.
 - **Open makers.** The three makers are ours. Who provides liquidity on mainnet is an open question.
 - **Funding.** There is no funding rate. Only the makers' pricing keeps quotes near spot.

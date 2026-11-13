@@ -1,10 +1,15 @@
-//! The trading accounts. Each belongs to someone's browser: the browser
-//! holds the key that signs, and hands this process only the account's
-//! viewing and nullifier keys, for as long as its session lasts. With those
-//! the desk finds the quotes addressed to the account, builds and proves its
-//! opens and closes, and sends each transaction back to the browser to sign.
+//! The trading accounts. Each belongs to someone's browser, which holds
+//! every key of the account: the one that signs, and the viewing and
+//! nullifier keys its notes are read and spent with. The browser reads its
+//! own balance, builds each open and close, and proves it. This process is
+//! handed the finished proofs, which are public the moment they land. It
+//! puts them in the program's instruction, sends the transaction back to
+//! the browser to sign, and sends it to Solana.
 //!
-//! One thread serves every account, one job at a time: each job is a proof.
+//! So of a trader, the desk knows what its makers know as the other side of
+//! the trade, and nothing more: not the balance, not the other notes.
+//!
+//! One thread serves every account, one job at a time.
 
 use std::{
     collections::HashMap,
@@ -16,24 +21,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use perps_sdk::{
-    index::index_trader_quotes,
-    instructions::{open::OpenTransactionParams, settle::SettleTransactionParams},
+    instructions::{open::Open, settle::Settle},
     state::{PositionUtxo, QuoteUtxo},
-    ViewKeys,
+    OpenProof, SettleProof,
 };
 use solana_address::Address;
 use solana_keypair::Keypair;
 use solana_signature::Signature;
 use solana_signer::{Signer, SignerError};
 use spr_client::{ComputeBudgetConfig, Rpc};
-use spr_keypair::PublicKey;
-use spr_test_utils::{
-    test_validator_asserts::wait_for_merkle_proof,
-    wallet::{sync_wallet, ClientEd25519WalletAuthority, Filter, SyncWalletAuthority, Wallet},
-};
-use spr_transaction::WalletUtxo;
+use spr_interface::instruction::instruction_data::transact::TransactIxData;
+use spr_keypair::{PublicKey, ShieldedAddress};
+use spr_test_utils::test_validator_asserts::wait_for_merkle_proof;
 use spr_user_registry_interface::{
     instruction::{register, RegisterData},
     user_record_pda,
@@ -41,14 +42,13 @@ use spr_user_registry_interface::{
 
 use crate::{
     chain::{market_of, now_ms, solana_keypair, Chain, Config, MAX_PRICE_AGE_SECS, USDC},
-    desk::{Busy, PositionView, QuoteView, Shared},
+    desk::{PositionView, QuoteView, Shared},
     maker::{id_of, MakerJob},
+    opening::opening,
 };
 
 /// What the faucet shields, and what a new account starts with.
 const FAUCET: u64 = 5_000 * USDC;
-/// The faucet does not top up an account that already holds this much.
-const FAUCET_CEILING: u64 = 25_000 * USDC;
 const FAUCET_COOLDOWN: Duration = Duration::from_secs(60);
 /// Devnet SOL for transaction fees: an account below the floor is sent the
 /// grant, which pays for about five hundred transactions.
@@ -60,23 +60,20 @@ const GRANTS_PER_HOUR: usize = 120;
 /// open has to be proved and land first.
 const OPEN_HEADROOM_SECS: i64 = 40;
 const TICK: Duration = Duration::from_secs(3);
-const CLOSE_ATTEMPTS: u8 = 3;
 /// How long a browser has to sign a transaction it was sent.
 const SIGN_WAIT: Duration = Duration::from_secs(45);
-const QUOTE_SEARCH: Duration = Duration::from_secs(20);
-/// How far from the mark a market order may open, in hundredths of a percent.
-const TAKE_TOLERANCE_BPS: u64 = 100;
 
 pub enum TraderJob {
     /// A browser opened a session for this account.
     Login {
         account: String,
-        authority: Box<ClientEd25519WalletAuthority>,
+        address: Box<ShieldedAddress>,
     },
-    /// A maker posted this quote for the account to find.
-    Discover {
+    /// A maker posted this quote for the account, at `leaf` of the tree.
+    Posted {
         account: String,
         posted: Box<QuoteUtxo>,
+        leaf: u64,
         maker: usize,
         signature: String,
     },
@@ -86,13 +83,22 @@ pub enum TraderJob {
         maker: String,
         reason: String,
     },
+    /// The account's browser proved the open of this quote.
     Open {
         account: String,
         quote_id: String,
+        proof: Box<OpenProof>,
+        transact: Box<TransactIxData>,
     },
+    /// The account's browser proved the close of this position at `price`,
+    /// the price it read in `oracle`.
     Close {
         account: String,
         position_id: String,
+        oracle: Address,
+        price: u64,
+        proof: Box<SettleProof>,
+        transact: Box<TransactIxData>,
     },
     Faucet {
         account: String,
@@ -116,7 +122,7 @@ impl TraderJob {
     fn account(&self) -> &str {
         match self {
             Self::Login { account, .. }
-            | Self::Discover { account, .. }
+            | Self::Posted { account, .. }
             | Self::NoQuote { account, .. }
             | Self::Open { account, .. }
             | Self::Close { account, .. }
@@ -182,44 +188,18 @@ struct Position {
     maker: usize,
 }
 
-/// One account with a session open: its keys, and what it holds.
+/// One account with a session open. No key of the account's is here.
 struct Seat {
     /// The account's Solana address, which is also its name on the desk.
     account: String,
     pubkey: Address,
-    keys: ViewKeys,
-    authority: ClientEd25519WalletAuthority,
-    wallet: Wallet,
+    /// The account's shielded address: what a maker encrypts a quote to.
+    address: ShieldedAddress,
     signer: BrowserSigner,
     /// Each live quote, its leaf in the tree and its maker.
     quotes: HashMap<String, (QuoteUtxo, u64, usize)>,
     positions: HashMap<String, Position>,
     last_faucet: Option<Instant>,
-}
-
-impl Seat {
-    /// Decrypts whatever arrived since the last call and returns the
-    /// private balance.
-    fn sync(&mut self, chain: &Chain) -> Result<u64> {
-        sync_wallet(&mut self.wallet, &self.authority, &chain.client)
-            .map_err(|e| anyhow!("sync wallet: {e:?}"))?;
-        Ok(self.wallet.balance(chain.mint, None)?.amount)
-    }
-
-    /// One note worth at least `amount`: a transaction here spends one note.
-    fn note(&self, chain: &Chain, amount: u64) -> Result<WalletUtxo> {
-        self.wallet
-            .balance(chain.mint, Some(Filter::MinAmount(amount)))?
-            .utxos
-            .first()
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!(
-                    "no single note in your balance covers {:.2}; the balance is split across smaller notes",
-                    amount as f64 / USDC as f64
-                )
-            })
-    }
 }
 
 struct Trader {
@@ -230,6 +210,8 @@ struct Trader {
     seats: HashMap<String, Seat>,
     /// When the desk last paid an account's fees, for the hourly limit.
     grants: Vec<Instant>,
+    /// When the oracles were last read.
+    ticked: Instant,
 }
 
 pub fn run(
@@ -271,6 +253,11 @@ pub fn run(
             (Err(error), false) => eprintln!("trader: {error:#}"),
             (Ok(()), false) => {}
         }
+        // A browser proves a close at the price it reads here, so the price
+        // must not go stale while the jobs keep coming.
+        if trader.ticked.elapsed() >= TICK {
+            trader.tick();
+        }
     }
 }
 
@@ -285,55 +272,74 @@ impl Trader {
             makers: makers.to_vec(),
             seats: HashMap::new(),
             grants: Vec::new(),
+            ticked: Instant::now(),
         };
+        {
+            let mut desk = trader.shared.lock();
+            desk.mint = trader.chain.mint.to_string();
+            desk.asset_id = trader.chain.asset_id;
+        }
         trader.tick();
         Ok(trader)
     }
 
     fn handle(&mut self, job: TraderJob) -> Result<()> {
         match job {
-            TraderJob::Login { account, authority } => self.login(&account, *authority),
-            TraderJob::Discover {
+            TraderJob::Login { account, address } => self.login(&account, *address),
+            TraderJob::Posted {
                 account,
                 posted,
+                leaf,
                 maker,
                 signature,
             } => {
-                let outcome = self.with_seat(&account, |trader, seat| {
-                    trader.discover(seat, &posted, maker, &signature)
-                });
+                let outcome = match self.seats.get_mut(&account) {
+                    Some(seat) => Self::posted(
+                        &self.chain,
+                        &self.shared,
+                        seat,
+                        *posted,
+                        leaf,
+                        maker,
+                        &signature,
+                    ),
+                    // The account left while the maker was quoting.
+                    None => Ok(()),
+                };
                 self.shared.lock().book(&account).quote_answered();
-                // One maker failing to reach the account is not the request
-                // failing: the others may still answer.
-                if let Err(error) = &outcome {
-                    eprintln!("trader: discovering a quote: {error:#}");
-                }
-                self.take_best(&account);
-                Ok(())
+                outcome
             }
             TraderJob::NoQuote {
                 account,
                 maker,
                 reason,
             } => {
-                {
-                    let mut desk = self.shared.lock();
-                    let book = desk.book(&account);
-                    book.quote_answered();
-                    if book.awaiting_quotes == 0 && book.quotes.is_empty() {
-                        book.error = Some(format!("{maker} could not quote: {reason}"));
-                    }
+                let mut desk = self.shared.lock();
+                let book = desk.book(&account);
+                book.quote_answered();
+                if book.awaiting_quotes == 0 && book.quotes.is_empty() {
+                    book.error = Some(format!("{maker} could not quote: {reason}"));
                 }
-                self.take_best(&account);
                 Ok(())
             }
-            TraderJob::Open { account, quote_id } => {
-                self.with_seat(&account, |trader, seat| trader.open(seat, &quote_id))
-            }
+            TraderJob::Open {
+                account,
+                quote_id,
+                proof,
+                transact,
+            } => self.with_seat(&account, |trader, seat| {
+                trader.open(seat, &quote_id, *proof, *transact)
+            }),
             TraderJob::Close {
                 account,
                 position_id,
-            } => self.with_seat(&account, |trader, seat| trader.close(seat, &position_id)),
+                oracle,
+                price,
+                proof,
+                transact,
+            } => self.with_seat(&account, |trader, seat| {
+                trader.close(seat, &position_id, oracle, price, *proof, *transact)
+            }),
             TraderJob::Faucet { account } => {
                 self.with_seat(&account, |trader, seat| trader.faucet(seat))
             }
@@ -341,13 +347,15 @@ impl Trader {
                 account,
                 position_id,
             } => {
-                if !self.seats.contains_key(&account) {
-                    return Ok(());
-                }
-                self.with_seat(&account, |trader, seat| {
+                if let Some(seat) = self.seats.get_mut(&account) {
                     seat.positions.remove(&position_id);
-                    trader.refresh_balance(seat)
-                })
+                }
+                self.shared
+                    .lock()
+                    .book(&account)
+                    .openings
+                    .remove(&position_id);
+                Ok(())
             }
             TraderJob::Recovered {
                 account,
@@ -356,16 +364,23 @@ impl Trader {
                 leaf,
                 maker,
             } => {
-                if let Some(seat) = self.seats.get_mut(&account) {
-                    seat.positions.insert(
-                        position_id,
-                        Position {
-                            utxo: *position,
-                            leaf,
-                            maker,
-                        },
-                    );
-                }
+                let Some(seat) = self.seats.get_mut(&account) else {
+                    return Ok(());
+                };
+                let input = position.to_input_utxo(self.chain.tree_id, leaf)?;
+                self.shared
+                    .lock()
+                    .book(&account)
+                    .openings
+                    .insert(position_id.clone(), opening(&input, &position.terms.maker));
+                seat.positions.insert(
+                    position_id,
+                    Position {
+                        utxo: *position,
+                        leaf,
+                        maker,
+                    },
+                );
                 Ok(())
             }
         }
@@ -388,35 +403,18 @@ impl Trader {
 
     /// Seats an account: pays its first fees, publishes its address so
     /// makers can find its positions again, and funds a new one.
-    fn login(&mut self, account: &str, authority: ClientEd25519WalletAuthority) -> Result<()> {
+    fn login(&mut self, account: &str, address: ShieldedAddress) -> Result<()> {
         if self.seats.contains_key(account) {
             // The same account in another tab: it is already seated.
-            return self.with_seat(account, |trader, seat| trader.refresh_balance(seat));
+            return Ok(());
         }
-        let address = authority
-            .shielded_address()
+        let pubkey = address
+            .solana_address()
             .map_err(|e| anyhow!("account address: {e:?}"))?;
-        let pubkey = authority.solana_pubkey();
-        let keys = ViewKeys {
-            address,
-            nullifier_key: authority
-                .spend_nullifier_key()
-                .map_err(|e| anyhow!("account keys: {e:?}"))?,
-            viewing_key: authority
-                .viewing_keys()
-                .map_err(|e| anyhow!("account keys: {e:?}"))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("the account has no viewing key"))?,
-        };
-        let wallet = Wallet::new(address, self.chain.assets.clone())
-            .map_err(|e| anyhow!("account wallet: {e:?}"))?;
         let mut seat = Seat {
             account: account.into(),
             pubkey,
-            keys,
-            authority,
-            wallet,
+            address,
             signer: BrowserSigner {
                 shared: Arc::clone(&self.shared),
                 account: account.into(),
@@ -428,25 +426,22 @@ impl Trader {
         };
         self.grant_fees(&seat)?;
         self.register(&seat)?;
-        let balance = seat.sync(&self.chain)?;
-        let is_new = {
-            let mut desk = self.shared.lock();
-            let book = desk.book(account);
-            book.positions.is_empty() && book.ledger.is_empty()
-        };
-        if balance == 0 && is_new {
+        // The desk cannot read the account's balance, so it remembers which
+        // accounts it has funded.
+        let funded = self.shared.lock().book(account).funded;
+        if !funded {
             self.shared.label(account, "Adding test dollars");
             self.chain.shield(&self.deployer, &address, FAUCET)?;
             seat.last_faucet = Some(Instant::now());
+            self.shared.update(|desk| desk.book(account).funded = true);
         }
-        self.refresh_balance(&mut seat)?;
+        self.seats.insert(account.into(), seat);
         // Whatever the account left open is with the makers.
         for maker in &self.makers {
             let _ = maker.send(MakerJob::Resend {
                 account: account.into(),
             });
         }
-        self.seats.insert(account.into(), seat);
         println!("trader: seated {account}");
         Ok(())
     }
@@ -480,8 +475,8 @@ impl Trader {
             seat.pubkey,
             seat.pubkey,
             RegisterData {
-                nullifier_pubkey: seat.keys.address.nullifier_pubkey,
-                viewing_pubkey: *seat.keys.address.viewing_pubkey.as_bytes(),
+                nullifier_pubkey: seat.address.nullifier_pubkey,
+                viewing_pubkey: *seat.address.viewing_pubkey.as_bytes(),
             },
         );
         self.chain.client.rpc().create_and_send_transaction(
@@ -493,15 +488,10 @@ impl Trader {
         Ok(())
     }
 
-    fn refresh_balance(&mut self, seat: &mut Seat) -> Result<()> {
-        let balance = seat.sync(&self.chain)?;
-        self.shared.lock().book(&seat.account).balance = balance.to_string();
-        Ok(())
-    }
-
     /// Reads the oracles, drops the quotes whose time is up, and unseats
-    /// the accounts whose last session has closed: their keys go with them.
+    /// the accounts whose last session has closed.
     fn tick(&mut self) {
+        self.ticked = Instant::now();
         let marks = self.chain.marks();
         let now = now_ms();
         let mut desk = self.shared.lock();
@@ -525,11 +515,14 @@ impl Trader {
             book.quotes.retain(|quote| quote.expires_at > now);
             let live: Vec<&str> = book.quotes.iter().map(|quote| quote.id.as_str()).collect();
             seat.quotes.retain(|id, _| live.contains(&id.as_str()));
+            book.openings
+                .retain(|id, _| seat.quotes.contains_key(id) || seat.positions.contains_key(id));
         }
         for account in gone {
             self.seats.remove(&account);
             let book = desk.book(&account);
             book.quotes.clear();
+            book.openings.clear();
             book.busy = None;
             book.sign = None;
             book.error = None;
@@ -537,31 +530,22 @@ impl Trader {
         }
     }
 
-    /// Finds `posted` the way any trader would: by scanning the indexer for
-    /// quotes encrypted to this account, and checking the maker each names
-    /// against the user registry.
-    fn discover(
-        &mut self,
+    /// Puts a quote a maker posted on the account's book, with the opening
+    /// the account's browser needs to accept it.
+    fn posted(
+        chain: &Chain,
+        shared: &Shared,
         seat: &mut Seat,
-        posted: &QuoteUtxo,
+        posted: QuoteUtxo,
+        leaf: u64,
         maker: usize,
         signature: &str,
     ) -> Result<()> {
-        let client = &self.chain.client;
-        let quote = index_trader_quotes(
-            &seat.keys,
-            &seat.wallet.registry,
-            client.indexer(),
-            client.rpc(),
-            QUOTE_SEARCH,
-        )?
-        .into_iter()
-        .find(|quote| &quote.quote_utxo == posted)
-        .ok_or_else(|| anyhow!("the quote is not among those addressed to this account"))?;
-        let terms = &quote.quote_utxo.terms;
+        let terms = &posted.terms;
         let market = market_of(&terms.feed_id)?;
-        let id = id_of(&quote.quote_utxo.hash(self.chain.tree_id)?);
-        let mut desk = self.shared.lock();
+        let input = posted.to_input_utxo(chain.tree_id, leaf)?;
+        let id = id_of(&input.utxo_hash);
+        let mut desk = shared.lock();
         let view = QuoteView {
             id: id.clone(),
             market: market.symbol.into(),
@@ -579,82 +563,31 @@ impl Trader {
             size: terms.size.to_string(),
             entry_price: terms.entry_price.to_string(),
             trader_margin: terms.trader_margin.to_string(),
-            maker_margin: quote.quote_utxo.maker_margin.to_string(),
+            maker_margin: posted.maker_margin.to_string(),
             maintenance_margin: terms.maintenance_margin.to_string(),
             expires_at: (terms.expiry as i64 - OPEN_HEADROOM_SECS).max(0) as u64 * 1000,
             signature: signature.into(),
         };
-        desk.book(&seat.account).quotes.push(view);
+        let book = desk.book(&seat.account);
+        book.quotes.push(view);
+        book.openings
+            .insert(id.clone(), opening(&input, &terms.maker));
         drop(desk);
-        seat.quotes
-            .insert(id, (quote.quote_utxo, quote.leaf_index, maker));
+        seat.quotes.insert(id, (posted, leaf, maker));
         Ok(())
     }
 
-    /// A market order's second half. Once every maker has answered, opens
-    /// the quote with the best price, as long as that price is still within
-    /// `TAKE_TOLERANCE_BPS` of the mark the account saw when it asked.
-    fn take_best(&mut self, account: &str) {
-        let chosen = {
-            let mut desk = self.shared.lock();
-            let book = desk.book(account);
-            if book.awaiting_quotes > 0 {
-                return;
-            }
-            let Some(mark) = book.take.take() else {
-                return;
-            };
-            let price = |quote: &QuoteView| quote.entry_price.parse::<u64>().unwrap_or(0);
-            let margin = |quote: &QuoteView| quote.maker_margin.parse::<u64>().unwrap_or(0);
-            // The best price for a long is the lowest, for a short the
-            // highest; between equal prices, the higher profit cap.
-            let best = book.quotes.iter().max_by_key(|quote| {
-                let price = price(quote);
-                let rank = if quote.side == "long" {
-                    u64::MAX - price
-                } else {
-                    price
-                };
-                (rank, margin(quote))
-            });
-            let Some(best) = best else {
-                book.busy = None;
-                if book.error.is_none() {
-                    book.error = Some("no maker answered; try again".into());
-                }
-                return;
-            };
-            if price(best).abs_diff(mark) > mark / 10_000 * TAKE_TOLERANCE_BPS {
-                book.busy = None;
-                book.error = Some(
-                    "the price moved while the makers were quoting, so nothing was opened; \
-                     their offers are below if you still want one"
-                        .into(),
-                );
-                return;
-            }
-            let id = best.id.clone();
-            book.busy = Some(Busy {
-                quote_id: Some(id.clone()),
-                ..Busy::new("take", &format!("Opening with {}", best.maker.name))
-            });
-            id
-        };
-        match self.with_seat(account, |trader, seat| trader.open(seat, &chosen)) {
-            Ok(()) => {
-                let mut desk = self.shared.lock();
-                let book = desk.book(account);
-                book.busy = None;
-                book.sign = None;
-            }
-            Err(error) => self.shared.fail(account, &error),
-        }
-    }
-
-    /// Accepts a quote: both margins move into one private position. The
-    /// account's other quotes go off its book: they were offers for the same
-    /// trade, and their makers take the margin back when they expire.
-    fn open(&mut self, seat: &mut Seat, quote_id: &str) -> Result<()> {
+    /// Sends the open the account's browser proved: both margins move into
+    /// one private position. The account's other quotes go off its book:
+    /// they were offers for the same trade, and their makers take the margin
+    /// back when they expire.
+    fn open(
+        &mut self,
+        seat: &mut Seat,
+        quote_id: &str,
+        proof: OpenProof,
+        transact: TransactIxData,
+    ) -> Result<()> {
         let expired = || anyhow!("that quote has expired");
         let (quote_utxo, quote_leaf_index, maker) =
             seat.quotes.get(quote_id).cloned().ok_or_else(expired)?;
@@ -667,32 +600,51 @@ impl Trader {
             .find(|view| view.id == quote_id)
             .cloned()
             .ok_or_else(expired)?;
-        seat.sync(&self.chain)?;
-        let trader_input = seat.note(&self.chain, quote_utxo.terms.trader_margin)?;
-        let transaction = OpenTransactionParams {
-            quote_utxo,
-            quote_leaf_index,
-            trader_input,
+        let terms = &quote_utxo.terms;
+        // The quote is the open's first input, and the open circuit fixes
+        // the position to the quote's opening and that nullifier: the desk
+        // knows the position without reading anything of the trader's.
+        let first_nullifier = quote_utxo
+            .to_input_utxo(self.chain.tree_id, quote_leaf_index)?
+            .nullifier;
+        let opened = quote_utxo.derived_position(seat.address, &first_nullifier)?;
+        let instruction = Open {
             payer: seat.pubkey,
-            tree_id: self.chain.tree_id,
+            maker: terms
+                .maker
+                .solana_address()
+                .map_err(|e| anyhow!("maker address: {e:?}"))?,
+            viewing_pubkey: *terms.maker.viewing_pubkey.as_bytes(),
+            tree: self.chain.tree,
+            open_proof: proof,
+            spp_proof: transact,
         }
-        .build(&seat.keys)?;
-        let opened = transaction.position_utxo.clone();
-        let client = &self.chain.client;
-        let instruction = transaction
-            .prove(client.indexer(), self.chain.tree, &seat.keys)?
-            .instruction()?;
+        .instruction()?;
         self.shared.label(&seat.account, "Sending to Solana");
         let signature = self.chain.send(&seat.signer, instruction)?;
         self.chain.indexed(signature)?;
         let hash = opened.hash(self.chain.tree_id)?;
+        let client = &self.chain.client;
         let leaf = wait_for_merkle_proof(client.indexer(), self.chain.tree, hash).leaf_index;
         let id = id_of(&hash);
+        let input = opened.to_input_utxo(self.chain.tree_id, leaf)?;
 
         self.shared.update(|desk| {
             desk.closed_quotes.push(quote_id.into());
             let book = desk.book(&seat.account);
             book.quotes.clear();
+            book.openings.clear();
+            for (held, position) in &seat.positions {
+                if let Ok(input) = position
+                    .utxo
+                    .to_input_utxo(self.chain.tree_id, position.leaf)
+                {
+                    book.openings
+                        .insert(held.clone(), opening(&input, &position.utxo.terms.maker));
+                }
+            }
+            book.openings
+                .insert(id.clone(), opening(&input, &opened.terms.maker));
             let frame = book.positions.len() as u32 + 1;
             book.positions.push(PositionView {
                 id: id.clone(),
@@ -746,53 +698,57 @@ impl Trader {
                 maker,
             },
         );
-        self.refresh_balance(seat)
+        Ok(())
     }
 
-    /// Closes at whatever the oracle account reads. The proof commits to one
-    /// price, so a close that lands just after Pyth updated the account is
-    /// proved again at the new price.
-    fn close(&mut self, seat: &mut Seat, position_id: &str) -> Result<()> {
-        let (utxo, leaf, maker) = {
+    /// Sends the close the account's browser proved. The proof commits to
+    /// one price, the one the browser read in `oracle`; the program reads
+    /// the same account, so a close that lands just after Pyth updated it
+    /// fails there, and the browser proves again at the new price.
+    fn close(
+        &mut self,
+        seat: &mut Seat,
+        position_id: &str,
+        oracle: Address,
+        price: u64,
+        proof: SettleProof,
+        transact: TransactIxData,
+    ) -> Result<()> {
+        let (utxo, maker) = {
             let position = seat
                 .positions
                 .get(position_id)
                 .ok_or_else(|| anyhow!("that position is not open"))?;
-            (position.utxo.clone(), position.leaf, position.maker)
+            (position.utxo.clone(), position.maker)
         };
         let market = market_of(&utxo.terms.feed_id)?;
-        let mut attempt = 0;
-        let (price, payout, signature) = loop {
-            attempt += 1;
-            let mark = self.chain.settle_mark(market)?;
-            let price = mark.price;
-            let transaction = SettleTransactionParams {
-                position_utxo: utxo.clone(),
-                position_leaf_index: leaf,
-                oracle: mark.account,
-                price,
-                payer: seat.pubkey,
-                tree_id: self.chain.tree_id,
-            }
-            .build(&seat.keys)?;
-            let payout = transaction.trader_payout;
-            let instruction = transaction
-                .prove(self.chain.client.indexer(), self.chain.tree)?
-                .instruction()?;
-            self.shared.label(&seat.account, "Sending to Solana");
-            match self.chain.send(&seat.signer, instruction) {
-                Ok(signature) => break (price, payout, signature),
-                Err(error) if attempt < CLOSE_ATTEMPTS => {
-                    eprintln!("trader: close attempt {attempt} at {price}: {error:#}");
-                    self.shared.label(&seat.account, "Proving the close again");
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        ensure!(
+            market.oracles.contains(&oracle),
+            "that is not a price account of {}",
+            market.symbol
+        );
+        let payout = utxo.trader_payout(price);
+        let instruction = Settle {
+            payer: seat.pubkey,
+            signer: seat.pubkey,
+            oracle,
+            maker: utxo
+                .terms
+                .maker
+                .solana_address()
+                .map_err(|e| anyhow!("maker address: {e:?}"))?,
+            tree: self.chain.tree,
+            settle_proof: proof,
+            spp_proof: transact,
+        }
+        .instruction()?;
+        self.shared.label(&seat.account, "Sending to Solana");
+        let signature = self.chain.send(&seat.signer, instruction)?;
         self.chain.indexed(signature)?;
 
         self.shared.update(|desk| {
             let book = desk.book(&seat.account);
+            book.openings.remove(position_id);
             let mut counterparty = None;
             if let Some(position) = book
                 .positions
@@ -821,23 +777,21 @@ impl Trader {
                 position_id: position_id.into(),
             });
         }
-        self.refresh_balance(seat)
+        Ok(())
     }
 
+    /// Shields more test dollars to the account. The desk cannot see what
+    /// the account holds, so the only limit is how often.
     fn faucet(&mut self, seat: &mut Seat) -> Result<()> {
-        if seat.sync(&self.chain)? >= FAUCET_CEILING {
-            bail!("you already have plenty of test dollars");
-        }
         if seat
             .last_faucet
             .is_some_and(|at| at.elapsed() < FAUCET_COOLDOWN)
         {
             bail!("the faucet just paid you; give it a minute");
         }
-        self.chain
-            .shield(&self.deployer, &seat.keys.address, FAUCET)?;
+        self.chain.shield(&self.deployer, &seat.address, FAUCET)?;
         seat.last_faucet = Some(Instant::now());
-        self.refresh_balance(seat)
+        Ok(())
     }
 }
 

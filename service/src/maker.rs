@@ -327,7 +327,7 @@ impl Maker {
     }
 
     /// Posts a quote for `trader` at the oracle price, moved by this maker's
-    /// spread, and hands it to the trader's account to discover.
+    /// spread, and hands its opening to the trader's account.
     fn quote(
         &mut self,
         account: &str,
@@ -397,9 +397,10 @@ impl Maker {
             attempts: 0,
         });
         self.trader
-            .send(TraderJob::Discover {
+            .send(TraderJob::Posted {
                 account: account.into(),
                 posted: Box::new(posted),
+                leaf,
                 maker: self.spec.index,
                 signature: signature.to_string(),
             })

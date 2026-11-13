@@ -18,8 +18,7 @@ use spr_keypair::ShieldedAddress;
 
 use crate::chain::now_ms;
 
-/// A session nobody has used for this long is closed, and the account's
-/// keys leave this process with its last session.
+/// A session nobody has used for this long is closed.
 const SESSION_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
 
 const LEDGER_LENGTH: usize = 60;
@@ -41,6 +40,9 @@ pub struct MakerView {
 pub struct MarketView {
     pub symbol: String,
     pub name: String,
+    /// The Pyth feed id, in hex: a browser checks a quote and a position
+    /// against it before it proves.
+    pub feed: String,
     /// The feed's exponent: a price tick is ten to this power, in dollars.
     pub expo: i32,
     /// The oracle account's price and when Pyth published it (unix seconds).
@@ -137,8 +139,8 @@ impl Busy {
     }
 }
 
-/// A transaction the account's browser has to sign: the desk builds and
-/// proves, but the key that signs never leaves the browser.
+/// A transaction the account's browser has to sign: the desk assembles and
+/// sends it, but the key that signs never leaves the browser.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignRequest {
@@ -147,11 +149,10 @@ pub struct SignRequest {
     pub message: String,
 }
 
-/// One trading account's side of the desk.
+/// One trading account's side of the desk. The account's balance is not
+/// here: only its own browser can read its notes.
 #[derive(Default)]
 pub struct Book {
-    /// The account's private balance.
-    pub balance: String,
     pub quotes: Vec<QuoteView>,
     pub positions: Vec<PositionView>,
     pub ledger: Vec<EventView>,
@@ -163,9 +164,12 @@ pub struct Book {
     signed: Option<(u64, [u8; 64])>,
     /// Makers that have not yet answered the current request.
     pub awaiting_quotes: usize,
-    /// Set while the account wants the best quote opened as soon as every
-    /// maker has answered: the mark when it asked, to judge the quotes by.
-    pub take: Option<u64>,
+    /// The opening of each live quote and each open position, by id, for
+    /// the account's browser to prove with: see `opening.rs`. Held in
+    /// memory only.
+    pub openings: HashMap<String, Value>,
+    /// Whether the faucet has paid this account its first test dollars.
+    pub funded: bool,
     sequence: u64,
 }
 
@@ -181,7 +185,9 @@ pub struct Desk {
     pub ready: bool,
     pub network: String,
     pub program: String,
+    /// The test dollar, and the id the pool knows it by.
     pub mint: String,
+    pub asset_id: u64,
     pub markets: Vec<MarketView>,
     /// How old a price the program still settles at, in seconds.
     pub max_price_age: i64,
@@ -212,6 +218,7 @@ struct Saved {
 struct SavedBook {
     positions: Vec<PositionView>,
     ledger: Vec<EventView>,
+    funded: bool,
 }
 
 pub struct Shared {
@@ -231,7 +238,9 @@ impl Shared {
             .map(|(account, book)| {
                 let sequence = book.ledger.len() as u64 + book.positions.len() as u64;
                 let book = Book {
-                    balance: "0".into(),
+                    // An account with history was funded before this was
+                    // recorded.
+                    funded: book.funded || sequence > 0,
                     positions: book.positions,
                     ledger: book.ledger,
                     sequence,
@@ -268,13 +277,15 @@ impl Shared {
             "network": desk.network,
             "program": desk.program,
             "mint": desk.mint,
+            "assetId": desk.asset_id.to_string(),
             "markets": desk.markets,
             "maxPriceAge": desk.max_price_age,
             "makers": desk.makers,
             "session": account.is_some(),
             "wallet": account.unwrap_or(""),
-            "balance": if book.balance.is_empty() { "0" } else { &book.balance },
             "quotes": book.quotes,
+            "awaiting": book.awaiting_quotes,
+            "openings": book.openings,
             "positions": book.positions,
             "ledger": book.ledger,
             "busy": book.busy,
@@ -291,11 +302,14 @@ impl Shared {
             books: desk
                 .books
                 .iter()
-                .filter(|(_, book)| !book.positions.is_empty() || !book.ledger.is_empty())
+                .filter(|(_, book)| {
+                    book.funded || !book.positions.is_empty() || !book.ledger.is_empty()
+                })
                 .map(|(account, book)| {
                     let book = SavedBook {
                         positions: book.positions.clone(),
                         ledger: book.ledger.clone(),
+                        funded: book.funded,
                     };
                     (account.clone(), book)
                 })
@@ -320,7 +334,6 @@ impl Shared {
         book.busy = None;
         book.sign = None;
         book.awaiting_quotes = 0;
-        book.take = None;
         book.error = Some(format!("{error:#}"));
     }
 
@@ -384,10 +397,7 @@ impl Shared {
 
 impl Desk {
     pub fn book(&mut self, account: &str) -> &mut Book {
-        self.books.entry(account.into()).or_insert_with(|| Book {
-            balance: "0".into(),
-            ..Book::default()
-        })
+        self.books.entry(account.into()).or_default()
     }
 
     /// One actor is connected, registered and funded.
@@ -487,4 +497,14 @@ pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
         *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
     }
     Some(bytes)
+}
+
+/// The bytes of a hex string of any even length.
+pub fn unhex_vec(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
+        return None;
+    }
+    (0..text.len() / 2)
+        .map(|index| u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok())
+        .collect()
 }

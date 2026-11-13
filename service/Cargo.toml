@@ -4,16 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
-# The devnet desk: three maker wallets held by this process, and a trading
-# account for every browser that opens a session. The browser keeps the key
-# that signs; this process holds the account's viewing and nullifier keys
-# while the session lasts, to build and prove. A real deployment would prove
-# in the browser too.
+# The devnet desk: three maker wallets held by this process, and a seat for
+# every browser that opens a session. A trader's keys stay in its browser,
+# which builds and proves its own transactions; this process assembles and
+# sends them, and relays the browser's requests to Helius.
 
 [dependencies]
 anyhow = { workspace = true }
 perps-program = { path = "../program", features = ["circuits"] }
 perps-sdk = { path = "../sdk" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 solana-account = { workspace = true }
@@ -29,3 +29,4 @@ spr-program = { workspace = true, features = ["client"] }
 spr-test-utils = { workspace = true }
 spr-transaction = { workspace = true }
 spr-user-registry-interface = { workspace = true, features = ["solana"] }
+wincode = { workspace = true }
