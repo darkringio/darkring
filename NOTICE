@@ -1,0 +1,13 @@
+Darkring
+Copyright 2026 The Darkring contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product includes software from Solana Privacy Rings (Zolana),
+https://github.com/helius-labs/zolana, licensed under the Apache License,
+Version 2.0. The program, the SDK, the test utilities, the scripts and the
+documents under docs/reference/ began as that project's confidential swap
+example and have been changed since.
+
+Darkring is an independent project. It is not affiliated with or endorsed by
+Helius, the Solana Foundation or Pyth.

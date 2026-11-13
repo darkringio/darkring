@@ -180,3 +180,7 @@ A trader's wallet signs one message, and the browser derives a separate trading 
 | GitHub | [darkringio](https://github.com/darkringio) |
 
 Built on [Solana Privacy Rings](https://github.com/helius-labs/zolana) by Helius, with prices from [Pyth](https://pyth.network). Darkring is an independent project and is not affiliated with or endorsed by Helius, the Solana Foundation or Pyth.
+
+## License
+
+[Apache License 2.0](LICENSE). Parts of this repository began as the confidential swap example of Solana Privacy Rings, which carries the same license; see [NOTICE](NOTICE).
