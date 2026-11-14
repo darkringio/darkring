@@ -34,7 +34,6 @@ use solana_signer::{Signer, SignerError};
 use spr_client::{ComputeBudgetConfig, Rpc};
 use spr_interface::instruction::instruction_data::transact::TransactIxData;
 use spr_keypair::{PublicKey, ShieldedAddress};
-use spr_test_utils::test_validator_asserts::wait_for_merkle_proof;
 use spr_user_registry_interface::{
     instruction::{register, RegisterData},
     user_record_pda,
@@ -112,7 +111,6 @@ pub enum TraderJob {
         position_id: String,
         position: Box<PositionUtxo>,
         maker: usize,
-        signature: Signature,
     },
     /// A maker settled this position.
     Liquidated {
@@ -384,13 +382,9 @@ impl Trader {
                 position_id,
                 position,
                 maker,
-                signature,
             } => {
-                self.chain.indexed(signature)?;
                 let hash = position.hash(self.chain.tree_id)?;
-                let client = &self.chain.client;
-                let leaf =
-                    wait_for_merkle_proof(client.indexer(), self.chain.tree, hash).leaf_index;
+                let leaf = self.chain.leaf(hash)?;
                 // The account may have left meanwhile: its maker still has
                 // to know, and hands the opening back on the next session.
                 if self.seats.contains_key(&account) {
@@ -770,7 +764,6 @@ impl Trader {
             position_id: id.clone(),
             position: Box::new(opened.clone()),
             maker,
-            signature,
         });
         seat.positions.insert(
             id,

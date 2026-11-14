@@ -15,14 +15,23 @@
 //! - **Asking less when nobody is here.** [`pace`] is how often the oracle
 //!   prices are read: often while somebody trades, seldom while the desk is
 //!   empty.
+//! - **Knowing what was asked.** Nearly all of the limit goes on the Rings
+//!   indexer and prover, not on plain RPC. Every request to them is counted
+//!   by method, the desk's own through [`Counted`] and the browsers' in the
+//!   relay, and [`run_reports`] prints the counts, so a change that costs
+//!   requests shows up in the log and not on the provider's bill.
 
 use std::{
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Mutex, OnceLock,
     },
+    thread::sleep,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use spr_api::{ApiError, BlockingHttpClient, HttpRequest, HttpResponse};
 
 /// What a browser is told while the provider refuses the desk.
 pub const REFUSED: &str = "The desk can’t reach devnet right now: its RPC provider says the usage limit is reached. Nothing was sent, and your balance and positions are untouched. Try again later.";
@@ -38,6 +47,29 @@ const PACE_TRADING: Duration = Duration::from_secs(3);
 const PACE_WATCHED: Duration = Duration::from_secs(6);
 const PACE_HOLDING: Duration = Duration::from_secs(30);
 const PACE_EMPTY: Duration = Duration::from_secs(90);
+
+/// How often the counts are printed, when there is anything to print.
+const REPORT_EVERY: Duration = Duration::from_secs(600);
+/// A method name longer than this, or the hundredth different one, is
+/// counted as "other": a browser chooses the names the relay sees.
+const NAME_LENGTH: usize = 56;
+const NAMES: usize = 100;
+
+/// Who asked the provider, and for what kind of thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Asked {
+    /// The desk's own makers and trader, of the Rings indexer.
+    DeskIndexer,
+    /// A browser, of the Rings indexer or the enclave prover, through the relay.
+    TabIndexer,
+    /// A browser, of the Solana node, through the relay.
+    TabRpc,
+}
+
+/// Requests since the last report, by who asked and the method asked for.
+static COUNTS: Mutex<BTreeMap<(Asked, String), u64>> = Mutex::new(BTreeMap::new());
+/// Every request to the indexer and prover since the process started.
+static INDEXER_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 /// The provider key, so it can be struck from anything that still holds it.
 static KEY: OnceLock<String> = OnceLock::new();
@@ -151,6 +183,111 @@ pub fn recovered() {
     }
 }
 
+/// The method a request to `url` asks for: the last piece of its path.
+pub fn method_of(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+}
+
+/// Counts one request for `method`.
+pub fn count(asked: Asked, method: &str) {
+    if asked != Asked::TabRpc {
+        INDEXER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    }
+    let plain = !method.is_empty()
+        && method.len() <= NAME_LENGTH
+        && method
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte));
+    let mut counts = COUNTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let name =
+        if plain && (counts.len() < NAMES || counts.contains_key(&(asked, method.to_owned()))) {
+            method
+        } else {
+            "other"
+        };
+    *counts.entry((asked, name.to_owned())).or_default() += 1;
+}
+
+/// How many requests have gone to the indexer and prover since the process
+/// started: the difference across an action is what the action cost.
+pub fn indexer_requests() -> u64 {
+    INDEXER_REQUESTS.load(Ordering::Relaxed)
+}
+
+/// What was asked since the last call, in words, or nothing if nothing was.
+pub fn report() -> Option<String> {
+    let counts = std::mem::take(
+        &mut *COUNTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    if counts.is_empty() {
+        return None;
+    }
+    let part = |asked: Asked, who: &str| {
+        let mine: Vec<(&str, u64)> = counts
+            .iter()
+            .filter(|((by, _), _)| *by == asked)
+            .map(|((_, name), count)| (name.as_str(), *count))
+            .collect();
+        let total: u64 = mine.iter().map(|(_, count)| count).sum();
+        (total > 0).then(|| {
+            let methods: Vec<String> = mine
+                .iter()
+                .map(|(name, count)| format!("{name} {count}"))
+                .collect();
+            format!("{who} {total} ({})", methods.join(", "))
+        })
+    };
+    let parts: Vec<String> = [
+        part(Asked::DeskIndexer, "the desk asked the indexer"),
+        part(Asked::TabIndexer, "browsers asked the indexer and prover"),
+        part(Asked::TabRpc, "browsers asked the node"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Some(parts.join("; "))
+}
+
+/// Prints the counts every ten minutes for as long as the process runs.
+pub fn run_reports() {
+    loop {
+        sleep(REPORT_EVERY);
+        if let Some(line) = report() {
+            println!("usage: in the last ten minutes {line}");
+        }
+    }
+}
+
+/// The HTTP client the desk's own indexer requests go through: it counts
+/// each by method, and starts a rest when the provider refuses.
+#[derive(Debug)]
+pub struct Counted(reqwest::blocking::Client);
+
+impl Counted {
+    pub fn new() -> Self {
+        Self(reqwest::blocking::Client::new())
+    }
+}
+
+impl BlockingHttpClient for Counted {
+    fn send(&self, request: HttpRequest) -> Result<HttpResponse, ApiError> {
+        count(Asked::DeskIndexer, method_of(&request.url));
+        let response = BlockingHttpClient::send(&self.0, request)?;
+        if response.status.as_u16() == 429 {
+            rest();
+        }
+        Ok(response)
+    }
+}
+
 /// How often to read the oracle prices, given who needs them.
 pub fn pace(trading: bool, watched: bool, holding: bool) -> Duration {
     if trading {
@@ -198,6 +335,41 @@ mod tests {
             shown(&anyhow::anyhow!("the quote has expired")),
             "the quote has expired"
         );
+    }
+
+    #[test]
+    fn requests_are_counted_by_who_asked_and_for_what() {
+        assert_eq!(
+            method_of("https://x.example/v1/spr/get_merkle_proofs?api-key=k"),
+            "get_merkle_proofs"
+        );
+        assert_eq!(
+            method_of("/prove/transfer_confidential_1_2/indexed"),
+            "indexed"
+        );
+        let before = indexer_requests();
+        count(Asked::DeskIndexer, "get_merkle_proofs");
+        count(Asked::DeskIndexer, "get_merkle_proofs");
+        count(Asked::TabIndexer, "prove/transfer_confidential_1_2/indexed");
+        count(Asked::TabRpc, "getSlot");
+        // A name a browser made up does not get a row of its own.
+        count(Asked::TabIndexer, "<script>");
+        assert_eq!(indexer_requests() - before, 4);
+        let line = report().expect("something was counted");
+        assert!(
+            line.contains("the desk asked the indexer 2 (get_merkle_proofs 2)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("browsers asked the indexer and prover 2"),
+            "{line}"
+        );
+        assert!(line.contains("other 1"), "{line}");
+        assert!(
+            line.contains("browsers asked the node 1 (getSlot 1)"),
+            "{line}"
+        );
+        assert!(report().is_none());
     }
 
     #[test]

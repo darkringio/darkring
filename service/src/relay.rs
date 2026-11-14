@@ -134,6 +134,11 @@ pub fn relay(
     let url = upstream(config, method, target, &body)?;
     // While the provider refuses the desk it refuses the browsers behind it too.
     ensure!(!usage::resting(), usage::REFUSED);
+    let path = target.split('?').next().unwrap_or(target);
+    match path.strip_prefix("/rings") {
+        Some(method) => usage::count(usage::Asked::TabIndexer, method.trim_matches('/')),
+        None => usage::count(usage::Asked::TabRpc, "calls"),
+    }
     let method = match method {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,

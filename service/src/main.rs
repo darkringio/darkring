@@ -209,6 +209,7 @@ fn main() -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || tape::run(shared));
     }
+    thread::spawn(usage::run_reports);
 
     let listener = TcpListener::bind(("127.0.0.1", config.port))
         .with_context(|| format!("binding 127.0.0.1:{}", config.port))?;

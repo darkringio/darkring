@@ -3,12 +3,13 @@
 //! oracle price makes it liquidatable.
 
 use std::{
+    collections::HashSet,
     sync::{
         mpsc::{Receiver, RecvTimeoutError, Sender},
         Arc,
     },
     thread::sleep,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
@@ -24,7 +25,6 @@ use perps_sdk::{
 };
 use solana_keypair::Keypair;
 use spr_keypair::ShieldedAddress;
-use spr_test_utils::test_validator_asserts::wait_for_merkle_proof;
 
 use crate::{
     chain::{
@@ -43,13 +43,6 @@ const FLOAT_FLOOR: u64 = 3_000 * USDC;
 const FLOAT: u64 = 20_000 * USDC;
 const TICK: Duration = Duration::from_secs(4);
 const CANCEL_ATTEMPTS: u8 = 3;
-/// A maker reads its notes again this long after it last did, so a quote
-/// does not have to wait for it.
-const NOTES_STALE: Duration = Duration::from_secs(20);
-/// How long after an account connects or asks for a quote the notes are
-/// kept fresh between requests. Past it nothing is asked of the indexer
-/// until the next quote, which reads the notes itself.
-const KEEN_FOR: Duration = Duration::from_secs(180);
 
 pub struct MakerSpec {
     pub index: usize,
@@ -121,14 +114,14 @@ struct Maker {
     trader: Sender<TraderJob>,
     pending: Vec<Pending>,
     held: Vec<Held>,
-    /// When the maker last read its notes, and whether it has sent a
-    /// transaction of its own since: one that spent a note it still lists.
-    synced: Instant,
-    spent: bool,
-    /// When an account last connected or asked this maker for a quote: for
-    /// a few minutes after, the next quote is likely, and the notes are
-    /// kept fresh for it.
-    wanted: Option<Instant>,
+    /// The notes this maker has spent since it last read them, by hash. The
+    /// wallet still lists them, so a quote must not pick one again.
+    ///
+    /// Reading the notes costs several indexer requests, and nothing but
+    /// this maker's own quotes spends them. So they are read at the start
+    /// and then only when no note the maker knows of, and has not used,
+    /// covers a quote: not on a timer, and not before every quote.
+    used: HashSet<[u8; 32]>,
 }
 
 pub fn run(
@@ -181,11 +174,7 @@ pub fn run(
                     });
                 }
             }
-            Ok(MakerJob::Resend { account }) => {
-                // An account has just connected: a quote may follow.
-                maker.wanted = Some(Instant::now());
-                maker.resend(&account)
-            }
+            Ok(MakerJob::Resend { account }) => maker.resend(&account),
             Ok(MakerJob::Opened {
                 account,
                 quote_id,
@@ -221,7 +210,7 @@ impl Maker {
         let chain = Chain::connect(config)?;
         let mut actor = Actor::load(config, &chain, spec.file)?;
         actor.sync(&chain)?;
-        if actor.note(&chain, FLOAT_FLOOR).is_err() {
+        if actor.note(&chain, FLOAT_FLOOR, &HashSet::new()).is_err() {
             let deployer: Keypair = solana_keypair(config, "devnet-deployer.json")?;
             chain.shield(&deployer, &actor.keypair.shielded_address()?, FLOAT)?;
             actor.sync(&chain)?;
@@ -241,9 +230,7 @@ impl Maker {
             trader: trader.clone(),
             pending: Vec::new(),
             held: Vec::new(),
-            synced: Instant::now(),
-            spent: false,
-            wanted: None,
+            used: HashSet::new(),
         };
         maker.recover()?;
         Ok(maker)
@@ -384,19 +371,18 @@ impl Maker {
         );
 
         let mut lap = Laps::start();
-        self.wanted = Some(Instant::now());
-        // The notes are read between requests (`tick`), so a quote usually
-        // starts from a fresh list without waiting for one.
-        if self.spent || self.synced.elapsed() > NOTES_STALE {
-            self.refresh()?;
-        }
-        let source = match self.actor.note(&self.chain, maker_margin) {
+        let asked = usage::indexer_requests();
+        let source = match self.actor.note(&self.chain, maker_margin, &self.used) {
             Ok(source) => source,
+            // Every note this maker knows of is used or too small: the
+            // change from its earlier quotes, and what closed positions
+            // paid it, are notes it has not read yet.
             Err(_) => {
                 self.refresh()?;
-                self.actor.note(&self.chain, maker_margin)?
+                self.actor.note(&self.chain, maker_margin, &self.used)?
             }
         };
+        let spending = source.utxo_hash;
         lap.mark("notes");
         let terms = QuoteTerms {
             feed_id: market.feed,
@@ -424,14 +410,16 @@ impl Maker {
             .instruction()?;
         lap.mark("prove");
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
+        self.used.insert(spending);
         lap.mark("send");
-        self.chain.indexed(signature)?;
-        lap.mark("indexed");
         let hash = posted.hash(self.chain.tree_id)?;
-        let leaf = wait_for_merkle_proof(client.indexer(), self.chain.tree, hash).leaf_index;
+        let leaf = self.chain.leaf(hash)?;
         lap.mark("leaf");
-        println!("maker {}: quoted in {lap}", self.spec.name);
-        self.spent = true;
+        println!(
+            "maker {}: quoted in {lap}, with {} indexer requests",
+            self.spec.name,
+            usage::indexer_requests() - asked
+        );
         let id = id_of(&hash);
         self.shared.update(|desk| {
             desk.book(account).log(
@@ -468,28 +456,15 @@ impl Maker {
         }
         self.reclaim();
         self.liquidate();
-        // The notes are kept fresh for a few minutes after an account
-        // connects or asks for a quote, so its next quote does not wait for
-        // them. Past that a quote reads them itself, and an idle desk asks
-        // nothing of the indexer.
-        let keen = self.wanted.is_some_and(|at| at.elapsed() < KEEN_FOR);
-        if keen && (self.spent || self.synced.elapsed() > NOTES_STALE) {
-            if let Err(error) = self.refresh() {
-                eprintln!(
-                    "maker {}: reading notes: {}",
-                    self.spec.name,
-                    usage::scrub(&format!("{error:#}"))
-                );
-                usage::note(&error);
-            }
-        }
     }
 
-    /// Reads the maker's notes from the indexer.
+    /// Reads the maker's notes from the indexer. A note stays in `used`
+    /// until the wallet stops listing it: a read that comes before the
+    /// indexer has the spending transaction would otherwise offer it again.
     fn refresh(&mut self) -> Result<()> {
         self.actor.sync(&self.chain)?;
-        self.synced = Instant::now();
-        self.spent = false;
+        let (actor, chain) = (&self.actor, &self.chain);
+        self.used.retain(|hash| actor.lists(chain, hash));
         Ok(())
     }
 
@@ -534,9 +509,9 @@ impl Maker {
         let instruction = transaction
             .prove(self.chain.client.indexer(), self.chain.tree)?
             .instruction()?;
+        // The margin comes back as a new note. Nothing here needs it
+        // indexed: the maker finds it the next time it reads its notes.
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
-        self.chain.indexed(signature)?;
-        self.spent = true;
         if let Some(account) = &pending.account {
             self.shared.update(|desk| {
                 desk.book(account).log(
@@ -643,9 +618,9 @@ impl Maker {
         let instruction = transaction
             .prove(self.chain.client.indexer(), self.chain.tree)?
             .instruction()?;
+        // The maker's share comes back as a new note, found the next time
+        // it reads its notes.
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
-        self.chain.indexed(signature)?;
-        self.spent = true;
         let id = held.id.clone();
         let account = held.account.clone();
         self.shared.update(|desk| {

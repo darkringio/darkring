@@ -2,9 +2,11 @@
 //! they all do with it.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::OnceLock,
-    time::{SystemTime, UNIX_EPOCH},
+    thread::sleep,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -14,6 +16,7 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_signature::Signature;
 use solana_signer::Signer;
+use spr_api::BlockingSprApi;
 use spr_client::{
     fetch_asset_id, user_registry::ensure_registered, ComputeBudgetConfig, ProofDataSource,
     ProverClient, Rpc, SolanaRpc, SprClient, SprIndexer,
@@ -26,11 +29,16 @@ use spr_test_utils::{
 };
 use spr_transaction::{AssetRegistry, WalletUtxo};
 
-use crate::desk::unhex;
+use crate::{desk::unhex, usage};
 
 // The whole per-transaction budget: an instruction verifies an SPP proof and
 // its own.
 const TRANSACT_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+/// About how far the indexer is behind a confirmed transaction: asking it
+/// sooner is usually a request wasted.
+const INDEXER_LAG: Duration = Duration::from_millis(450);
+/// After that, how long to wait before each further try, in milliseconds.
+const LEAF_WAITS_MS: [u64; 6] = [0, 500, 1000, 2000, 4000, 8000];
 
 /// A market: a Pyth feed, and the price update accounts kept for it on
 /// devnet. The program settles a position against whichever feed its quote
@@ -256,7 +264,11 @@ impl Chain {
     pub fn connect(config: &Config) -> Result<Self> {
         let client = SprClient::new(
             SolanaRpc::new(config.rpc_url.clone()),
-            SprIndexer::new(&config.spr_url),
+            // Through a client that counts every request: see `usage`.
+            SprIndexer::with_api(BlockingSprApi::with_client(
+                &config.spr_url,
+                usage::Counted::new(),
+            )),
             ProverClient::default(),
         )
         .with_proof_data_source(ProofDataSource::Client);
@@ -291,12 +303,35 @@ impl Chain {
         )?)
     }
 
-    /// Waits until the indexer has the transaction's outputs.
-    pub fn indexed(&self, signature: Signature) -> Result<()> {
-        self.client
-            .confirm_private_transaction_sync(signature)
-            .map_err(|e| anyhow!("the indexer did not pick up {signature}: {e:?}"))?;
-        Ok(())
+    /// Where the output with this `hash` sits in the tree, once the indexer
+    /// has the transaction that made it.
+    ///
+    /// One question does two jobs: an answer means the transaction is
+    /// indexed, and the answer is the leaf. The indexer is about half a
+    /// second behind the chain, so the first question waits that long and
+    /// is usually the only one.
+    pub fn leaf(&self, hash: [u8; 32]) -> Result<u64> {
+        sleep(INDEXER_LAG);
+        let mut last = None;
+        for wait in LEAF_WAITS_MS {
+            sleep(Duration::from_millis(wait));
+            match self
+                .client
+                .indexer()
+                .get_merkle_proofs(self.tree, vec![hash], None)
+            {
+                Ok(response) => {
+                    if let Some(proof) = response.proofs.into_iter().next() {
+                        return Ok(proof.leaf_index);
+                    }
+                }
+                Err(error) => last = Some(format!("{error:?}")),
+            }
+        }
+        Err(anyhow!(
+            "the indexer did not pick up the transaction: {}",
+            last.unwrap_or_else(|| "it has no proof for its output".into())
+        ))
     }
 
     /// The newest price any of `market`'s accounts holds for its feed,
@@ -387,6 +422,8 @@ impl Chain {
         })?;
         let view_tag = deposit.view_tag();
         let signature = deposit.send(&self.client, deployer, self.tree, deployer)?;
+        // Asking before the indexer can have it is a question wasted.
+        sleep(INDEXER_LAG * 2);
         wait_for_indexed_utxo(&self.client, view_tag, signature);
         Ok(signature)
     }
@@ -448,13 +485,22 @@ impl Actor {
         Ok(self.wallet.balance(chain.mint, None)?.amount)
     }
 
-    /// One note worth at least `amount`: a transaction here spends one note.
-    pub fn note(&self, chain: &Chain, amount: u64) -> Result<WalletUtxo> {
+    /// Whether the wallet still lists the note with this hash as unspent.
+    pub fn lists(&self, chain: &Chain, hash: &[u8; 32]) -> bool {
+        self.wallet
+            .balance(chain.mint, None)
+            .is_ok_and(|balance| balance.utxos.iter().any(|note| &note.utxo_hash == hash))
+    }
+
+    /// One note worth at least `amount`, leaving out the ones in `used`: a
+    /// transaction here spends one note, and the wallet goes on listing a
+    /// note this process has spent until it reads its notes again.
+    pub fn note(&self, chain: &Chain, amount: u64, used: &HashSet<[u8; 32]>) -> Result<WalletUtxo> {
         self.wallet
             .balance(chain.mint, Some(Filter::MinAmount(amount)))?
             .utxos
-            .first()
-            .cloned()
+            .into_iter()
+            .find(|note| !used.contains(&note.utxo_hash))
             .ok_or_else(|| {
                 anyhow!(
                     "no single sealed note covers {:.2}; the balance is split across smaller notes",

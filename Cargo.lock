@@ -3383,6 +3383,7 @@ dependencies = [
  "solana-keypair",
  "solana-signature",
  "solana-signer",
+ "spr-api",
  "spr-client",
  "spr-interface",
  "spr-keypair",

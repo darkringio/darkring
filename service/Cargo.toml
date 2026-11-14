@@ -22,6 +22,7 @@ solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }
+spr-api = { workspace = true, features = ["reqwest"] }
 spr-client = { workspace = true, features = ["reqwest", "solana-rpc"] }
 spr-interface = { workspace = true }
 spr-keypair = { workspace = true }
