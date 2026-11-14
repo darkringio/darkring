@@ -32,6 +32,7 @@ use crate::{
     },
     desk::{MakerView, PositionView, Shared},
     trader::TraderJob,
+    usage,
 };
 
 /// Seconds a quote can be opened for, on chain. The desk shows less: an
@@ -45,6 +46,10 @@ const CANCEL_ATTEMPTS: u8 = 3;
 /// A maker reads its notes again this long after it last did, so a quote
 /// does not have to wait for it.
 const NOTES_STALE: Duration = Duration::from_secs(20);
+/// How long after an account connects or asks for a quote the notes are
+/// kept fresh between requests. Past it nothing is asked of the indexer
+/// until the next quote, which reads the notes itself.
+const KEEN_FOR: Duration = Duration::from_secs(180);
 
 pub struct MakerSpec {
     pub index: usize,
@@ -120,6 +125,10 @@ struct Maker {
     /// transaction of its own since: one that spent a note it still lists.
     synced: Instant,
     spent: bool,
+    /// When an account last connected or asked this maker for a quote: for
+    /// a few minutes after, the next quote is likely, and the notes are
+    /// kept fresh for it.
+    wanted: Option<Instant>,
 }
 
 pub fn run(
@@ -135,12 +144,18 @@ pub fn run(
         match Maker::boot(&config, &spec, &view, &shared, &trader) {
             Ok(maker) => break maker,
             Err(error) => {
-                eprintln!("maker {name}: {error:#}; trying again");
-                sleep(Duration::from_secs(15));
+                eprintln!(
+                    "maker {name}: {}; trying again",
+                    usage::scrub(&format!("{error:#}"))
+                );
+                usage::note(&error);
+                sleep(Duration::from_secs(15).max(usage::rest_left()));
             }
         }
     };
     maker.spec = spec;
+    // Connecting took answers from the provider: any rest is over.
+    usage::recovered();
     shared.lock().booted();
     println!("maker {name}: ready");
     loop {
@@ -154,7 +169,11 @@ pub fn run(
                 leverage,
             }) => {
                 if let Err(error) = maker.quote(&account, market, trader, long, size, leverage) {
-                    eprintln!("maker {name}: no quote: {error:#}");
+                    eprintln!(
+                        "maker {name}: no quote: {}",
+                        usage::scrub(&format!("{error:#}"))
+                    );
+                    usage::note(&error);
                     let _ = maker.trader.send(TraderJob::NoQuote {
                         account,
                         maker: name.into(),
@@ -162,7 +181,11 @@ pub fn run(
                     });
                 }
             }
-            Ok(MakerJob::Resend { account }) => maker.resend(&account),
+            Ok(MakerJob::Resend { account }) => {
+                // An account has just connected: a quote may follow.
+                maker.wanted = Some(Instant::now());
+                maker.resend(&account)
+            }
             Ok(MakerJob::Opened {
                 account,
                 quote_id,
@@ -220,6 +243,7 @@ impl Maker {
             held: Vec::new(),
             synced: Instant::now(),
             spent: false,
+            wanted: None,
         };
         maker.recover()?;
         Ok(maker)
@@ -360,6 +384,7 @@ impl Maker {
         );
 
         let mut lap = Laps::start();
+        self.wanted = Some(Instant::now());
         // The notes are read between requests (`tick`), so a quote usually
         // starts from a fresh list without waiting for one.
         if self.spent || self.synced.elapsed() > NOTES_STALE {
@@ -437,11 +462,25 @@ impl Maker {
     }
 
     fn tick(&mut self) {
+        // While the provider refuses, asking again only prolongs it.
+        if usage::resting() {
+            return;
+        }
         self.reclaim();
         self.liquidate();
-        if self.spent || self.synced.elapsed() > NOTES_STALE {
+        // The notes are kept fresh for a few minutes after an account
+        // connects or asks for a quote, so its next quote does not wait for
+        // them. Past that a quote reads them itself, and an idle desk asks
+        // nothing of the indexer.
+        let keen = self.wanted.is_some_and(|at| at.elapsed() < KEEN_FOR);
+        if keen && (self.spent || self.synced.elapsed() > NOTES_STALE) {
             if let Err(error) = self.refresh() {
-                eprintln!("maker {}: reading notes: {error:#}", self.spec.name);
+                eprintln!(
+                    "maker {}: reading notes: {}",
+                    self.spec.name,
+                    usage::scrub(&format!("{error:#}"))
+                );
+                usage::note(&error);
             }
         }
     }
@@ -518,13 +557,31 @@ impl Maker {
         if self.held.is_empty() {
             return;
         }
-        // One read of each market this maker has a position in.
+        // The prices the desk already reads say which positions are worth
+        // a look, so a position that is nowhere near its liquidation price
+        // costs no read of its own.
+        let seen: Vec<(String, u64)> = {
+            let desk = self.shared.lock();
+            desk.markets
+                .iter()
+                .filter_map(|view| Some((view.symbol.clone(), view.price.parse().ok()?)))
+                .collect()
+        };
+        // One fresh read of each market with a position to settle: the
+        // settle is proved at the price the program will read.
         let mut prices: Vec<(&'static Market, Mark)> = Vec::new();
         let mut due = Vec::new();
         for (index, held) in self.held.iter().enumerate() {
             let Ok(market) = market_of(&held.position.terms.feed_id) else {
                 continue;
             };
+            let near = seen
+                .iter()
+                .find(|(symbol, _)| symbol.as_str() == market.symbol)
+                .is_some_and(|(_, price)| *price > 0 && held.position.is_liquidatable(*price));
+            if !near {
+                continue;
+            }
             let known = prices
                 .iter()
                 .find(|(seen, _)| seen.symbol == market.symbol)

@@ -16,10 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use spr_keypair::ShieldedAddress;
 
-use crate::chain::now_ms;
+use crate::{chain::now_ms, usage};
 
 /// A session nobody has used for this long is closed.
 const SESSION_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
+/// A browser polls every second: one that has been quiet this long has gone.
+const WATCHED_FOR: Duration = Duration::from_secs(20);
 
 const LEDGER_LENGTH: usize = 60;
 
@@ -204,6 +206,8 @@ pub struct Desk {
     pub booting: usize,
     sessions: HashMap<String, Session>,
     next_sign: u64,
+    /// When a browser last asked for the desk's state.
+    watched: Option<Instant>,
 }
 
 /// What survives a restart. Open positions are matched again with what the
@@ -277,6 +281,9 @@ impl Shared {
             .unwrap_or(&empty);
         json!({
             "ready": desk.ready,
+            // True while the RPC provider is refusing the desk: nothing can
+            // be opened or closed until it answers again.
+            "resting": usage::refusing(),
             "network": desk.network,
             "program": desk.program,
             "mint": desk.mint,
@@ -331,13 +338,15 @@ impl Shared {
 
     /// Ends `account`'s current action with `error` on show.
     pub fn fail(&self, account: &str, error: &anyhow::Error) {
-        eprintln!("desk: {error:#}");
+        eprintln!("desk: {}", usage::scrub(&format!("{error:#}")));
+        usage::note(error);
         let mut desk = self.lock();
         let book = desk.book(account);
         book.busy = None;
         book.sign = None;
         book.awaiting_quotes = 0;
-        book.error = Some(format!("{error:#}"));
+        // Never the error as it came: the provider's URL holds the key.
+        book.error = Some(usage::shown(error));
     }
 
     /// Shows `label` on `account`'s current action.
@@ -438,6 +447,33 @@ impl Desk {
     pub fn expire_sessions(&mut self) {
         self.sessions
             .retain(|_, session| session.seen.elapsed() < SESSION_IDLE);
+    }
+
+    /// A browser asked for the desk's state just now.
+    pub fn watch(&mut self) {
+        self.watched = Some(Instant::now());
+    }
+
+    /// Whether a browser has the desk on screen: one asked for its state in
+    /// the last few polls.
+    pub fn watched(&self) -> bool {
+        self.watched.is_some_and(|at| at.elapsed() < WATCHED_FOR)
+    }
+
+    /// Whether an account is connected and its tab is still polling.
+    pub fn trading(&self) -> bool {
+        self.sessions
+            .values()
+            .any(|session| session.seen.elapsed() < WATCHED_FOR)
+    }
+
+    /// Whether any account has a position open: a maker may have to settle it.
+    pub fn holding(&self) -> bool {
+        self.books.values().any(|book| {
+            book.positions
+                .iter()
+                .any(|position| position.status == "open")
+        })
     }
 
     /// Whether any session still speaks for `account`.

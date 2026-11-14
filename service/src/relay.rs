@@ -14,7 +14,7 @@ use std::{sync::OnceLock, time::Duration};
 use anyhow::{anyhow, bail, ensure, Result};
 use serde_json::Value;
 
-use crate::chain::Config;
+use crate::{chain::Config, usage};
 
 /// The JSON-RPC methods a browser may call on the Solana node: reads the
 /// Rings client makes. The desk sends every transaction itself.
@@ -132,6 +132,8 @@ pub fn relay(
     body: Vec<u8>,
 ) -> Result<Answer> {
     let url = upstream(config, method, target, &body)?;
+    // While the provider refuses the desk it refuses the browsers behind it too.
+    ensure!(!usage::resting(), usage::REFUSED);
     let method = match method {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
@@ -149,6 +151,9 @@ pub fn relay(
         .send()
         .map_err(|_| anyhow!("Helius did not answer"))?;
     let status = response.status().as_u16();
+    if status == 429 {
+        usage::rest();
+    }
     let headers = response
         .headers()
         .iter()

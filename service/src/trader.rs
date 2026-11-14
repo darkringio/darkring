@@ -45,6 +45,7 @@ use crate::{
     desk::{PositionView, QuoteView, Shared},
     maker::{id_of, MakerJob},
     opening::opening,
+    usage,
 };
 
 /// What the faucet shields, and what a new account starts with.
@@ -237,18 +238,26 @@ pub fn run(
         match Trader::boot(&config, &shared, &own, &makers) {
             Ok(trader) => break trader,
             Err(error) => {
-                eprintln!("trader: {error:#}; trying again");
-                sleep(Duration::from_secs(15));
+                eprintln!(
+                    "trader: {}; trying again",
+                    usage::scrub(&format!("{error:#}"))
+                );
+                usage::note(&error);
+                sleep(Duration::from_secs(15).max(usage::rest_left()));
             }
         }
     };
+    // Connecting took answers from the provider: any rest is over.
+    usage::recovered();
     shared.lock().booted();
     println!("trader: ready");
     loop {
         let job = match jobs.recv_timeout(TICK) {
             Ok(job) => job,
             Err(RecvTimeoutError::Timeout) => {
-                trader.tick();
+                if trader.due() {
+                    trader.tick();
+                }
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -263,12 +272,15 @@ pub fn run(
                 book.sign = None;
             }
             (Err(error), true) => shared.fail(&account, &error),
-            (Err(error), false) => eprintln!("trader: {error:#}"),
+            (Err(error), false) => {
+                eprintln!("trader: {}", usage::scrub(&format!("{error:#}")));
+                usage::note(&error);
+            }
             (Ok(()), false) => {}
         }
         // A browser proves a close at the price it reads here, so the price
         // must not go stale while the jobs keep coming.
-        if trader.ticked.elapsed() >= TICK {
+        if trader.due() {
             trader.tick();
         }
     }
@@ -337,7 +349,11 @@ impl Trader {
                 let book = desk.book(&account);
                 book.quote_answered();
                 if book.awaiting_quotes == 0 && book.quotes.is_empty() {
-                    book.error = Some(format!("{maker} could not quote: {reason}"));
+                    book.error = Some(if usage::refused(&reason) {
+                        usage::REFUSED.to_owned()
+                    } else {
+                        format!("{maker} could not quote: {}", usage::scrub(&reason))
+                    });
                 }
                 Ok(())
             }
@@ -540,14 +556,39 @@ impl Trader {
         Ok(())
     }
 
+    /// Whether it is time to read the oracles again. They are read every
+    /// few seconds while somebody trades or watches, and seldom while the
+    /// desk is empty: every read counts against the provider's limit.
+    fn due(&self) -> bool {
+        let pace = {
+            let desk = self.shared.lock();
+            usage::pace(desk.trading(), desk.watched(), desk.holding())
+        };
+        self.ticked.elapsed() >= pace
+    }
+
     /// Reads the oracles, drops the quotes whose time is up, and unseats
     /// the accounts whose last session has closed.
     fn tick(&mut self) {
         self.ticked = Instant::now();
-        let marks = self.chain.marks();
+        // While the provider refuses, asking again only prolongs it.
+        let marks = if usage::resting() {
+            None
+        } else {
+            match self.chain.marks() {
+                Ok(marks) => {
+                    usage::recovered();
+                    Some(marks)
+                }
+                Err(error) => {
+                    usage::note(&error);
+                    None
+                }
+            }
+        };
         let now = now_ms();
         let mut desk = self.shared.lock();
-        if let Ok(marks) = marks {
+        if let Some(marks) = marks {
             for (view, mark) in desk.markets.iter_mut().zip(marks) {
                 if let Some(mark) = mark {
                     view.price = mark.price.to_string();

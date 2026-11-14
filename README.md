@@ -158,6 +158,8 @@ scripts/run-desk.sh
 
 This starts the desk service on `127.0.0.1:5374`. It needs a `.env` with `HELIUS_API_KEY` and the devnet wallets in `keys/`. Neither is in this repository.
 
+Every read of Solana and of the Rings indexer counts against that key's usage limit, so the service asks as little as it can ([`service/src/usage.rs`](service/src/usage.rs)). Oracle prices are read every 3 seconds while an account is connected, every 6 while somebody only has the desk open, every 30 while positions are open with nobody watching, and every 90 on an empty desk. Makers keep their notes fresh for three minutes after an account connects or asks for a quote, and not otherwise. When the provider answers that the limit is reached, the service stops asking for a while (30 seconds, doubling to 5 minutes), tells browsers that trading is paused, and picks up by itself when the provider answers again. An error never reaches a browser or the log with the provider's URL in it: the URL carries the key.
+
 A trader's wallet signs one message, and the browser derives a separate trading account from that signature. Every key of that account stays in the browser. The browser reads its own balance, and builds and proves each open and close itself:
 
 - **The program's proof** is made in the browser, with the program's own Rust compiled to WebAssembly. `scripts/build-web-package.sh` builds that package from the compiled circuits.

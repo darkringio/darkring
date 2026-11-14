@@ -34,6 +34,7 @@ mod opening;
 mod relay;
 mod tape;
 mod trader;
+mod usage;
 
 use std::{
     env,
@@ -91,6 +92,9 @@ const MAX_NOTIONAL_USD: f64 = 5_000_000.0;
 fn config() -> Result<Config> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let key = env::var("HELIUS_API_KEY").ok();
+    if let Some(key) = &key {
+        usage::keep_secret(key);
+    }
     let from_key = |path: &str| {
         key.as_ref()
             .map(|key| format!("https://devnet.helius-rpc.com/{path}?api-key={key}"))
@@ -319,7 +323,7 @@ fn serve(
                 } else {
                     "502 Bad Gateway"
                 };
-                let payload = json!({ "error": format!("{error:#}") }).to_string();
+                let payload = json!({ "error": usage::shown(&error) }).to_string();
                 write!(
                     stream,
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{payload}",
@@ -345,7 +349,7 @@ fn serve(
             } else {
                 "400 Bad Request"
             },
-            json!({ "error": format!("{error:#}") }).to_string(),
+            json!({ "error": usage::shown(&error) }).to_string(),
         ),
     };
     write!(
@@ -411,6 +415,7 @@ fn route(
         None => None,
     };
     if (request.method, request.path) == ("GET", "/api/state") {
+        shared.lock().watch();
         return Ok(shared.snapshot(session.as_ref().map(|(account, _)| account.as_str())));
     }
     // The chart's candles: market data, the same for everyone.
@@ -433,6 +438,11 @@ fn route(
     }
     if request.method != "POST" {
         bail!("no such route");
+    }
+    // Everything past here ends in a request to the provider. While it is
+    // refusing, say so at once instead of trying and failing slowly.
+    if usage::resting() && request.path != "/api/logout" && request.path != "/api/sign" {
+        bail!(usage::REFUSED);
     }
     let body: Value = if request.body.is_empty() {
         Value::Null
