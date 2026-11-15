@@ -109,7 +109,7 @@ pub struct PositionView {
 pub struct EventView {
     pub id: String,
     pub at: u64,
-    /// `quote`, `open`, `settle` or `reclaim`.
+    /// `quote`, `open`, `settle`, `reclaim`, `deposit` or `withdraw`.
     pub kind: String,
     /// The wallet that signed.
     pub actor: String,
@@ -119,6 +119,10 @@ pub struct EventView {
     #[serde(default)]
     pub market: Option<String>,
     pub price: Option<String>,
+    /// What a deposit or a withdrawal moved, in base units: public on
+    /// chain, unlike every other amount here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
     /// What the transaction carries but nobody else can read.
     pub sealed: Vec<String>,
     pub signature: String,
@@ -508,11 +512,29 @@ impl Book {
                 counterparty: counterparty.map(Into::into),
                 market: settled.map(|(market, _)| market.into()),
                 price: settled.map(|(_, price)| price.to_string()),
+                amount: None,
                 sealed: sealed.iter().map(|item| (*item).into()).collect(),
                 signature: signature.into(),
             },
         );
         self.ledger.truncate(LEDGER_LENGTH);
+    }
+
+    /// Records a deposit from `wallet` or a withdrawal to it. The amount
+    /// and the wallet are the browser's word: they are shown to nobody but
+    /// the account that sent them, and the transaction is on chain to check.
+    pub fn log_transfer(
+        &mut self,
+        kind: &str,
+        account: &str,
+        wallet: &str,
+        amount: u64,
+        signature: &str,
+    ) {
+        self.log(kind, account, Some(wallet), None, &[], signature);
+        if let Some(event) = self.ledger.first_mut() {
+            event.amount = Some(amount.to_string());
+        }
     }
 
     /// One maker has answered, with a quote or without.

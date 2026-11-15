@@ -18,6 +18,7 @@
 //!   POST /api/open     {"quoteId","proof":"<hex>","transact":"<hex>"}
 //!   POST /api/close    {"positionId","oracle","price","proof":"<hex>","transact":"<hex>"}
 //!   POST /api/faucet   shield another 5,000 test dollars to the account
+//!   POST /api/transfer {"kind":"deposit"|"withdraw","amount":"<base units>","wallet","transaction":"<hex>"}
 //!   any  /api/rings…   the Rings indexer and enclave prover at Helius
 //!   POST /api/rpc      a Solana node, for reads
 //!
@@ -35,6 +36,7 @@ mod opening;
 mod relay;
 mod tape;
 mod trader;
+mod transfer;
 mod usage;
 
 use std::{
@@ -669,6 +671,30 @@ fn route(
                     price,
                     proof: Box::new(proof),
                     transact: Box::new(transact),
+                })
+                .map_err(gone)?;
+        }
+        "/api/transfer" => {
+            let kind = transfer::Kind::named(&text("kind")?)
+                .ok_or_else(|| anyhow!("kind is deposit or withdraw"))?;
+            let amount = text("amount")?
+                .parse::<u64>()
+                .ok()
+                .filter(|amount| *amount > 0)
+                .ok_or_else(|| anyhow!("amount is not a number of base units"))?;
+            let wallet = Address::from_str(&text("wallet")?)
+                .map_err(|_| anyhow!("wallet is not a Solana address"))?;
+            let wire = unhex_vec(&text("transaction")?)
+                .filter(|wire| wire.len() <= transfer::MAX_WIRE)
+                .ok_or_else(|| anyhow!("transaction is not a transaction in hex"))?;
+            begin(Busy::new(kind.name(), "Sending to Solana"))?;
+            trader
+                .send(TraderJob::Transfer {
+                    account: account.into(),
+                    kind,
+                    amount,
+                    wallet,
+                    wire,
                 })
                 .map_err(gone)?;
         }

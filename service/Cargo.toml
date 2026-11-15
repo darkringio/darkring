@@ -20,7 +20,9 @@ solana-account = { workspace = true }
 solana-address = { workspace = true }
 solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
+solana-message = { workspace = true }
 solana-signature = { workspace = true }
+solana-transaction = { workspace = true }
 solana-signer = { workspace = true }
 spr-api = { workspace = true, features = ["reqwest"] }
 spr-client = { workspace = true, features = ["reqwest", "solana-rpc"] }

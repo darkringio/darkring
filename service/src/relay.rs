@@ -18,8 +18,10 @@ use crate::{chain::Config, usage};
 
 /// The JSON-RPC methods a browser may call on the Solana node: reads the
 /// Rings client makes. The desk sends every transaction itself.
-const RPC_METHODS: [&str; 7] = [
+const RPC_METHODS: [&str; 8] = [
     "getAccountInfo",
+    // A wallet's balance of the test dollar, for a deposit.
+    "getTokenAccountBalance",
     "getMultipleAccounts",
     "getLatestBlockhash",
     "getSlot",

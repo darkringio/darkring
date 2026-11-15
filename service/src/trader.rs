@@ -44,7 +44,7 @@ use crate::{
     desk::{PositionView, QuoteView, Shared},
     maker::{id_of, MakerJob},
     opening::opening,
-    usage,
+    transfer, usage,
 };
 
 /// What the faucet shields, and what a new account starts with.
@@ -54,6 +54,9 @@ const FAUCET_COOLDOWN: Duration = Duration::from_secs(60);
 /// grant, which pays for about five hundred transactions.
 const FEE_FLOOR: u64 = 1_000_000;
 const FEE_GRANT: u64 = 5_000_000;
+/// A first withdrawal to a wallet also pays the rent of the wallet's token
+/// account, about 0.002 SOL: an account needs this much before one.
+const TRANSFER_FEE_FLOOR: u64 = 3_000_000;
 /// How many accounts the desk pays fees for in an hour.
 const GRANTS_PER_HOUR: usize = 120;
 /// The desk stops offering a quote this long before it expires on chain: an
@@ -103,6 +106,15 @@ pub enum TraderJob {
     Faucet {
         account: String,
     },
+    /// The account's browser built and signed a deposit from `wallet` or a
+    /// withdrawal to it: `wire` is the whole transaction.
+    Transfer {
+        account: String,
+        kind: transfer::Kind,
+        amount: u64,
+        wallet: Address,
+        wire: Vec<u8>,
+    },
     /// An open has landed: find the position's leaf in the tree, which the
     /// account's browser needs to close it and its maker to settle it.
     Located {
@@ -136,6 +148,7 @@ impl TraderJob {
             | Self::Open { account, .. }
             | Self::Close { account, .. }
             | Self::Faucet { account }
+            | Self::Transfer { account, .. }
             | Self::Located { account, .. }
             | Self::Liquidated { account, .. }
             | Self::Recovered { account, .. } => account,
@@ -146,7 +159,11 @@ impl TraderJob {
     fn is_action(&self) -> bool {
         matches!(
             self,
-            Self::Login { .. } | Self::Open { .. } | Self::Close { .. } | Self::Faucet { .. }
+            Self::Login { .. }
+                | Self::Open { .. }
+                | Self::Close { .. }
+                | Self::Faucet { .. }
+                | Self::Transfer { .. }
         )
     }
 }
@@ -213,6 +230,8 @@ struct Seat {
 
 struct Trader {
     chain: Chain,
+    /// The Solana node deposits and withdrawals are sent through.
+    rpc_url: String,
     deployer: Keypair,
     shared: Arc<Shared>,
     makers: Vec<Sender<MakerJob>>,
@@ -295,6 +314,7 @@ impl Trader {
         let deployer = solana_keypair(config, "devnet-deployer.json")?;
         let mut trader = Self {
             chain,
+            rpc_url: config.rpc_url.clone(),
             deployer,
             shared: Arc::clone(shared),
             makers: makers.to_vec(),
@@ -376,6 +396,15 @@ impl Trader {
             TraderJob::Faucet { account } => {
                 self.with_seat(&account, |trader, seat| trader.faucet(seat))
             }
+            TraderJob::Transfer {
+                account,
+                kind,
+                amount,
+                wallet,
+                wire,
+            } => self.with_seat(&account, |trader, seat| {
+                trader.transfer(seat, kind, amount, wallet, &wire)
+            }),
             TraderJob::Located {
                 account,
                 quote_id,
@@ -486,7 +515,7 @@ impl Trader {
             positions: HashMap::new(),
             last_faucet: None,
         };
-        self.grant_fees(&seat)?;
+        self.grant_fees(&seat, FEE_FLOOR)?;
         self.register(&seat)?;
         // The desk cannot read the account's balance, so it remembers which
         // accounts it has funded.
@@ -508,9 +537,41 @@ impl Trader {
         Ok(())
     }
 
-    /// Sends the account devnet SOL for fees when it is short of it.
-    fn grant_fees(&mut self, seat: &Seat) -> Result<()> {
-        if self.chain.client.rpc().get_balance(seat.pubkey)? >= FEE_FLOOR {
+    /// Sends a deposit or a withdrawal the account's browser built and
+    /// signed, after checking it is the account's own and touches nothing
+    /// but the pool (see `transfer`).
+    fn transfer(
+        &mut self,
+        seat: &mut Seat,
+        kind: transfer::Kind,
+        amount: u64,
+        wallet: Address,
+        wire: &[u8],
+    ) -> Result<()> {
+        transfer::checked(wire, &seat.pubkey)?;
+        self.grant_fees(seat, TRANSFER_FEE_FLOOR)?;
+        let signature = transfer::broadcast(&self.rpc_url, wire)?;
+        println!(
+            "trader: {} of {:.2} for {}",
+            kind.name(),
+            amount as f64 / USDC as f64,
+            seat.account
+        );
+        self.shared.update(|desk| {
+            desk.book(&seat.account).log_transfer(
+                kind.name(),
+                &seat.account,
+                &wallet.to_string(),
+                amount,
+                &signature,
+            );
+        });
+        Ok(())
+    }
+
+    /// Sends the account devnet SOL for fees when it has less than `floor`.
+    fn grant_fees(&mut self, seat: &Seat, floor: u64) -> Result<()> {
+        if self.chain.client.rpc().get_balance(seat.pubkey)? >= floor {
             return Ok(());
         }
         self.grants
