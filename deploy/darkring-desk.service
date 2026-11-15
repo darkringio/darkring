@@ -12,6 +12,8 @@ Wants=network-online.target
 User=ubuntu
 WorkingDirectory=/var/www/ring
 Environment=HOME=/home/ubuntu
+# As root (the "+"): keep the makers' prover reachable from this machine only.
+ExecStartPre=+/var/www/ring/scripts/close-prover-ports.sh
 ExecStart=/var/www/ring/scripts/run-desk.sh
 Restart=on-failure
 RestartSec=10

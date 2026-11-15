@@ -27,7 +27,7 @@ use spr_test_utils::{
     test_validator_asserts::wait_for_indexed_utxo,
     wallet::{sync_wallet, Deposit, DepositParams, Filter, Wallet},
 };
-use spr_transaction::{AssetRegistry, WalletUtxo};
+use spr_transaction::{decrypt_spendable, AssetRegistry, ShieldedTransaction, WalletUtxo};
 
 use crate::{desk::unhex, usage};
 
@@ -334,6 +334,42 @@ impl Chain {
         ))
     }
 
+    /// The transaction with this `signature`, as the indexer has it, once
+    /// it has it: every output's hash and leaf, and the encrypted notes.
+    ///
+    /// Like [`leaf`](Self::leaf) this is one question, usually asked once.
+    /// It answers more: the sender's own outputs can be decrypted from it
+    /// (see [`Actor::learn`]), which saves reading the wallet again later.
+    pub fn landed(&self, signature: Signature) -> Result<Landed> {
+        sleep(INDEXER_LAG);
+        let mut last = None;
+        for wait in LEAF_WAITS_MS {
+            sleep(Duration::from_millis(wait));
+            match self
+                .client
+                .indexer()
+                .get_shielded_transactions_by_signature(signature, None)
+            {
+                Ok(response) if !response.transactions.is_empty() => {
+                    return Ok(Landed {
+                        transactions: response
+                            .transactions
+                            .into_iter()
+                            .map(|indexed| indexed.transaction)
+                            .collect(),
+                        latest_tree_id: response.output_tree_id,
+                    });
+                }
+                Ok(_) => last = None,
+                Err(error) => last = Some(format!("{error:?}")),
+            }
+        }
+        Err(anyhow!(
+            "the indexer did not pick up the transaction: {}",
+            last.unwrap_or_else(|| "it does not list it yet".into())
+        ))
+    }
+
     /// The newest price any of `market`'s accounts holds for its feed,
     /// whatever its age.
     pub fn mark(&self, market: &Market) -> Result<Mark> {
@@ -452,12 +488,36 @@ impl Chain {
     }
 }
 
+/// A transaction the indexer has picked up: its pool events, and the tree
+/// the indexer says new outputs go to.
+pub struct Landed {
+    transactions: Vec<ShieldedTransaction>,
+    latest_tree_id: Option<u16>,
+}
+
+impl Landed {
+    /// Where the output with this `hash` sits in the tree.
+    pub fn leaf(&self, hash: &[u8; 32]) -> Result<u64> {
+        self.transactions
+            .iter()
+            .flat_map(|transaction| &transaction.output_slots)
+            .find(|slot| &slot.output_context.hash == hash)
+            .map(|slot| slot.output_context.leaf_index)
+            .ok_or_else(|| anyhow!("the transaction has no such output"))
+    }
+}
+
 /// One wallet the desk holds the keys of: a maker's, with the notes it has
 /// decrypted so far.
 pub struct Actor {
     pub keypair: ShieldedKeypair,
     pub wallet: Wallet,
     pub pubkey: Address,
+    /// Notes this wallet got from transactions it sent itself, decrypted
+    /// from the transaction (see [`learn`](Self::learn)) instead of read
+    /// with the wallet. The next read of the wallet lists them too, and
+    /// empties this.
+    learned: Vec<WalletUtxo>,
 }
 
 impl Actor {
@@ -474,6 +534,7 @@ impl Actor {
             keypair,
             wallet,
             pubkey,
+            learned: Vec::new(),
         })
     }
 
@@ -482,24 +543,62 @@ impl Actor {
     pub fn sync(&mut self, chain: &Chain) -> Result<u64> {
         sync_wallet(&mut self.wallet, &self.keypair, &chain.client)
             .map_err(|e| anyhow!("sync wallet: {e:?}"))?;
+        // The indexer had these before it was asked just now.
+        self.learned.clear();
         Ok(self.wallet.balance(chain.mint, None)?.amount)
+    }
+
+    /// Takes this wallet's own notes out of a transaction it sent: the
+    /// change of a quote, for one. They are decrypted and checked against
+    /// their commitments the way a read of the wallet does it, but from
+    /// the one transaction, so it costs nothing more than the question
+    /// that fetched it. Returns how many notes of the test dollar it found.
+    pub fn learn(&mut self, chain: &Chain, landed: &Landed) -> Result<usize> {
+        let found = decrypt_spendable(&self.keypair, &landed.transactions, &chain.assets)
+            .map_err(|e| anyhow!("reading the transaction's notes: {e:?}"))?
+            .with_latest_tree_id(landed.latest_tree_id);
+        let mut count = 0;
+        for note in found.utxos() {
+            if note.utxo.asset.asset != chain.mint
+                || self
+                    .learned
+                    .iter()
+                    .any(|known| known.utxo_hash == note.utxo_hash)
+            {
+                continue;
+            }
+            self.learned.push(note.clone());
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Whether the wallet still lists the note with this hash as unspent.
     pub fn lists(&self, chain: &Chain, hash: &[u8; 32]) -> bool {
-        self.wallet
-            .balance(chain.mint, None)
-            .is_ok_and(|balance| balance.utxos.iter().any(|note| &note.utxo_hash == hash))
+        self.learned.iter().any(|note| &note.utxo_hash == hash)
+            || self
+                .wallet
+                .balance(chain.mint, None)
+                .is_ok_and(|balance| balance.utxos.iter().any(|note| &note.utxo_hash == hash))
     }
 
     /// One note worth at least `amount`, leaving out the ones in `used`: a
     /// transaction here spends one note, and the wallet goes on listing a
     /// note this process has spent until it reads its notes again.
     pub fn note(&self, chain: &Chain, amount: u64, used: &HashSet<[u8; 32]>) -> Result<WalletUtxo> {
-        self.wallet
-            .balance(chain.mint, Some(Filter::MinAmount(amount)))?
-            .utxos
-            .into_iter()
+        // The notes learned from this wallet's own transactions first: the
+        // wallet does not list them until it is read again.
+        let learned = self
+            .learned
+            .iter()
+            .filter(|note| note.utxo.amount >= amount)
+            .cloned();
+        learned
+            .chain(
+                self.wallet
+                    .balance(chain.mint, Some(Filter::MinAmount(amount)))?
+                    .utxos,
+            )
             .find(|note| !used.contains(&note.utxo_hash))
             .ok_or_else(|| {
                 anyhow!(

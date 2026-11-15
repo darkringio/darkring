@@ -20,9 +20,19 @@
 //!   by method, the desk's own through [`Counted`] and the browsers' in the
 //!   relay, and [`run_reports`] prints the counts, so a change that costs
 //!   requests shows up in the log and not on the provider's bill.
+//! - **A day's allowance.** The limit is for a month, and a month's limit
+//!   spent in a week leaves nobody able to close a position for the three
+//!   weeks after. So the desk gives itself a number of indexer and prover
+//!   requests for each day (UTC). Once they are used it opens nothing new
+//!   ([`standing`] is [`Standing::Closing`]): positions can still be closed
+//!   and liquidated. At twice the allowance it stops altogether until the
+//!   day turns ([`Standing::Shut`]), which is still better than the month
+//!   running out. The count is kept in a file, so a restart does not start
+//!   the day again.
 
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
@@ -35,6 +45,20 @@ use spr_api::{ApiError, BlockingHttpClient, HttpRequest, HttpResponse};
 
 /// What a browser is told while the provider refuses the desk.
 pub const REFUSED: &str = "The desk can’t reach devnet right now: its RPC provider says the usage limit is reached. Nothing was sent, and your balance and positions are untouched. Try again later.";
+
+/// What a browser is told when it asks for something new after the day's
+/// allowance is used, and when the desk has stopped for the day.
+pub const CLOSING: &str = "The desk has used today’s share of what its RPC provider allows on devnet, so it is not opening new positions or handing out test dollars. You can still close what you have open. It starts again at 00:00 UTC.";
+pub const SHUT: &str = "The desk has stopped for today: it has used twice its daily share of what its RPC provider allows on devnet. Your balance and positions are untouched. It starts again at 00:00 UTC.";
+
+/// Indexer and prover requests the desk allows itself in a day, unless
+/// `DESK_DAILY_REQUESTS` says otherwise. Zero is no allowance at all.
+pub const DAILY_REQUESTS: u64 = 3_000;
+/// At this many times the allowance the desk stops closing too.
+const SHUT_AT: u64 = 2;
+/// The day's count is written to its file every this many requests.
+const SAVE_EVERY: u64 = 20;
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The first rest after a refusal, and the longest, in seconds.
 const FIRST_REST_SECS: u64 = 30;
@@ -70,6 +94,14 @@ pub enum Asked {
 static COUNTS: Mutex<BTreeMap<(Asked, String), u64>> = Mutex::new(BTreeMap::new());
 /// Every request to the indexer and prover since the process started.
 static INDEXER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// The day the count below is for, in days since 1970 (UTC); the indexer
+/// and prover requests made that day; the day's allowance; and the file
+/// the first two are kept in.
+static DAY: AtomicU64 = AtomicU64::new(0);
+static DAY_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static ALLOWANCE: AtomicU64 = AtomicU64::new(0);
+static DAY_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 /// The provider key, so it can be struck from anything that still holds it.
 static KEY: OnceLock<String> = OnceLock::new();
@@ -183,6 +215,134 @@ pub fn recovered() {
     }
 }
 
+/// What the day's allowance lets the desk do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Everything.
+    Open,
+    /// Close and liquidate what is open; nothing new.
+    Closing,
+    /// Nothing until the day turns.
+    Shut,
+}
+
+impl Standing {
+    /// The name the web app knows it by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closing => "closing",
+            Self::Shut => "shut",
+        }
+    }
+}
+
+/// Where `used` requests leave a day that allows `allowance`. No allowance
+/// (zero) is no limit.
+fn standing_at(used: u64, allowance: u64) -> Standing {
+    if allowance == 0 || used < allowance {
+        Standing::Open
+    } else if used < allowance.saturating_mul(SHUT_AT) {
+        Standing::Closing
+    } else {
+        Standing::Shut
+    }
+}
+
+fn today() -> u64 {
+    now_ms() / DAY_MS
+}
+
+/// Indexer and prover requests made so far today.
+pub fn used_today() -> u64 {
+    if DAY.load(Ordering::Relaxed) == today() {
+        DAY_REQUESTS.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// What the day's allowance lets the desk do right now.
+pub fn standing() -> Standing {
+    standing_at(used_today(), ALLOWANCE.load(Ordering::Relaxed))
+}
+
+/// Why nothing at all can be asked of the provider right now, if that is
+/// so: it is refusing, or the desk has stopped for the day.
+pub fn paused() -> Option<&'static str> {
+    if resting() {
+        Some(REFUSED)
+    } else if standing() == Standing::Shut {
+        Some(SHUT)
+    } else {
+        None
+    }
+}
+
+/// Sets the day's allowance, and picks up the day's count from `file` if
+/// it was written today.
+pub fn allow(requests: u64, file: PathBuf) {
+    ALLOWANCE.store(requests, Ordering::Relaxed);
+    let saved = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    if let Some(saved) = saved {
+        if saved["day"].as_u64() == Some(today()) {
+            DAY.store(today(), Ordering::Relaxed);
+            DAY_REQUESTS.store(saved["requests"].as_u64().unwrap_or(0), Ordering::Relaxed);
+        }
+    }
+    let _ = DAY_FILE.set(file);
+    match requests {
+        0 => println!("usage: no daily allowance is set"),
+        _ => println!(
+            "usage: {} of today's {requests} indexer and prover requests are used",
+            used_today()
+        ),
+    }
+}
+
+/// Writes the day's count to its file.
+fn save() {
+    let Some(file) = DAY_FILE.get() else {
+        return;
+    };
+    let text = serde_json::json!({
+        "day": DAY.load(Ordering::Relaxed),
+        "requests": DAY_REQUESTS.load(Ordering::Relaxed),
+    })
+    .to_string();
+    if let Err(error) = std::fs::write(file, text) {
+        eprintln!("usage: writing {}: {error}", file.display());
+    }
+}
+
+/// Adds one request to the day's count, starting a new count on a new day.
+fn tally() {
+    let day = today();
+    if DAY.swap(day, Ordering::Relaxed) != day {
+        DAY_REQUESTS.store(0, Ordering::Relaxed);
+    }
+    let used = DAY_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let allowance = ALLOWANCE.load(Ordering::Relaxed);
+    let before = standing_at(used - 1, allowance);
+    let after = standing_at(used, allowance);
+    if before != after {
+        match after {
+            Standing::Closing => println!(
+                "usage: today's {allowance} requests are used; nothing new is opened until 00:00 UTC"
+            ),
+            Standing::Shut => {
+                println!("usage: {used} requests today; stopping altogether until 00:00 UTC")
+            }
+            Standing::Open => {}
+        }
+    }
+    if used % SAVE_EVERY == 0 || before != after {
+        save();
+    }
+}
+
 /// The method a request to `url` asks for: the last piece of its path.
 pub fn method_of(url: &str) -> &str {
     let path = url.split(['?', '#']).next().unwrap_or(url);
@@ -196,6 +356,7 @@ pub fn method_of(url: &str) -> &str {
 pub fn count(asked: Asked, method: &str) {
     if asked != Asked::TabRpc {
         INDEXER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        tally();
     }
     let plain = !method.is_empty()
         && method.len() <= NAME_LENGTH
@@ -261,7 +422,11 @@ pub fn run_reports() {
     loop {
         sleep(REPORT_EVERY);
         if let Some(line) = report() {
-            println!("usage: in the last ten minutes {line}");
+            println!(
+                "usage: in the last ten minutes {line}; {} today",
+                used_today()
+            );
+            save();
         }
     }
 }
@@ -304,6 +469,20 @@ pub fn pace(trading: bool, watched: bool, holding: bool) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_day_closes_at_its_allowance_and_shuts_at_twice_it() {
+        assert_eq!(standing_at(0, 100), Standing::Open);
+        assert_eq!(standing_at(99, 100), Standing::Open);
+        assert_eq!(standing_at(100, 100), Standing::Closing);
+        assert_eq!(standing_at(199, 100), Standing::Closing);
+        assert_eq!(standing_at(200, 100), Standing::Shut);
+    }
+
+    #[test]
+    fn no_allowance_is_no_limit() {
+        assert_eq!(standing_at(1_000_000, 0), Standing::Open);
+    }
 
     #[test]
     fn a_url_keeps_its_host_and_loses_the_rest() {

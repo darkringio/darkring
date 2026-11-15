@@ -132,8 +132,11 @@ pub fn relay(
     body: Vec<u8>,
 ) -> Result<Answer> {
     let url = upstream(config, method, target, &body)?;
-    // While the provider refuses the desk it refuses the browsers behind it too.
-    ensure!(!usage::resting(), usage::REFUSED);
+    // While the provider refuses the desk it refuses the browsers behind it
+    // too; and once the desk has stopped for the day, so have they.
+    if let Some(why) = usage::paused() {
+        bail!(why);
+    }
     let path = target.split('?').next().unwrap_or(target);
     match path.strip_prefix("/rings") {
         Some(method) => usage::count(usage::Asked::TabIndexer, method.trim_matches('/')),

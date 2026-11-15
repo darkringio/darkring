@@ -284,6 +284,9 @@ impl Shared {
             // True while the RPC provider is refusing the desk: nothing can
             // be opened or closed until it answers again.
             "resting": usage::refusing(),
+            // What the day's allowance of requests lets the desk do: "open",
+            // "closing" (nothing new, closes only) or "shut".
+            "allowance": usage::standing().name(),
             "network": desk.network,
             "program": desk.program,
             "mint": desk.mint,

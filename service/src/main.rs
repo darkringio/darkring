@@ -25,7 +25,8 @@
 //!
 //! Needs HELIUS_API_KEY (or DEVNET_RPC_URL and DEVNET_SPR_URL), ZOLANA_CLI_BIN
 //! for the local prover the makers use, and the wallets
-//! scripts/devnet-setup.sh makes.
+//! scripts/devnet-setup.sh makes. DESK_DAILY_REQUESTS sets how many indexer
+//! and prover requests the desk allows itself a day (see `usage`).
 
 mod chain;
 mod desk;
@@ -137,6 +138,16 @@ fn shielded(config: &Config, file: &str) -> Result<ShieldedKeypair> {
 
 fn main() -> Result<()> {
     let config = config()?;
+    // Before anything asks the provider: the day's count starts from its file.
+    usage::allow(
+        env::var("DESK_DAILY_REQUESTS")
+            .ok()
+            .and_then(|requests| requests.parse().ok())
+            .unwrap_or(usage::DAILY_REQUESTS),
+        // Beside the desk's state file, and named after it: a development
+        // desk with its own state file keeps its own count.
+        config.state_file.with_extension("usage.json"),
+    );
 
     // The makers' pool proofs are made on this machine, by the release
     // prover with the release keys. A trader's are made by Helius's enclave
@@ -442,8 +453,16 @@ fn route(
     }
     // Everything past here ends in a request to the provider. While it is
     // refusing, say so at once instead of trying and failing slowly.
-    if usage::resting() && request.path != "/api/logout" && request.path != "/api/sign" {
-        bail!(usage::REFUSED);
+    if request.path != "/api/logout" && request.path != "/api/sign" {
+        if let Some(why) = usage::paused() {
+            bail!(why);
+        }
+        // With the day's allowance used, only what closes a position goes on.
+        if usage::standing() != usage::Standing::Open
+            && matches!(request.path, "/api/quotes" | "/api/faucet")
+        {
+            bail!(usage::CLOSING);
+        }
     }
     let body: Value = if request.body.is_empty() {
         Value::Null

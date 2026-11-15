@@ -117,10 +117,12 @@ struct Maker {
     /// The notes this maker has spent since it last read them, by hash. The
     /// wallet still lists them, so a quote must not pick one again.
     ///
-    /// Reading the notes costs several indexer requests, and nothing but
+    /// Reading the notes costs dozens of indexer requests, and nothing but
     /// this maker's own quotes spends them. So they are read at the start
     /// and then only when no note the maker knows of, and has not used,
-    /// covers a quote: not on a timer, and not before every quote.
+    /// covers a quote: not on a timer, and not before every quote. A quote
+    /// keeps its own change (`Actor::learn`), so that is seldom: the maker
+    /// goes on spending the change of its last quote.
     used: HashSet<[u8; 32]>,
 }
 
@@ -413,10 +415,23 @@ impl Maker {
         self.used.insert(spending);
         lap.mark("send");
         let hash = posted.hash(self.chain.tree_id)?;
-        let leaf = self.chain.leaf(hash)?;
+        // One question tells where the quote sits and hands back the
+        // change, which the next quote can spend without the wallet being
+        // read again: that read is some thirty-five requests and seven
+        // seconds of somebody's order.
+        let landed = self.chain.landed(signature)?;
+        let leaf = landed.leaf(&hash)?;
+        let learned = match self.actor.learn(&self.chain, &landed) {
+            Ok(learned) => learned,
+            // Nothing is lost: the wallet finds the change when it is read.
+            Err(error) => {
+                eprintln!("maker {}: {error:#}", self.spec.name);
+                0
+            }
+        };
         lap.mark("leaf");
         println!(
-            "maker {}: quoted in {lap}, with {} indexer requests",
+            "maker {}: quoted in {lap}, with {} indexer requests, and kept {learned} note of change",
             self.spec.name,
             usage::indexer_requests() - asked
         );
@@ -450,8 +465,9 @@ impl Maker {
     }
 
     fn tick(&mut self) {
-        // While the provider refuses, asking again only prolongs it.
-        if usage::resting() {
+        // While the provider refuses, asking again only prolongs it; and
+        // when the desk has stopped for the day, so have its makers.
+        if usage::paused().is_some() {
             return;
         }
         self.reclaim();
