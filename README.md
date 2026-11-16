@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Trade perps on Solana without anyone seeing your size, direction, entry or liquidation price.<br>
+  Trade perps, options and predictions on Solana without anyone seeing your size, direction, entry or liquidation price.<br>
   On-chain it is two addresses and a proof.
 </p>
 
@@ -24,7 +24,9 @@
 
 # Darkring
 
-Darkring is a perpetuals protocol where the position itself is private. You go long or short with leverage, like on any perps venue, and nobody watching the chain can tell what you hold. It is built on [Solana Privacy Rings](https://github.com/helius-labs/zolana), the shielded pool by Helius.
+Darkring is a derivatives protocol where the position itself is private. You go long or short with leverage, buy a call or a put, or stake on where a price ends, and nobody watching the chain can tell what you hold. It is built on [Solana Privacy Rings](https://github.com/helius-labs/zolana), the shielded pool by Helius.
+
+It also has a way in and out that leaves no trail: [the veil](#the-veil).
 
 This repository is the protocol: the on-chain program, the SDK, the desk service and the tests. The website and the trading app are a separate codebase; you can use them at [app.darkring.io](https://app.darkring.io).
 
@@ -35,6 +37,8 @@ This repository is the protocol: the on-chain program, the SDK, the desk service
 
 - [What the chain sees](#what-the-chain-sees)
 - [How a position works](#how-a-position-works)
+- [Options and predictions](#options-and-predictions)
+- [The veil](#the-veil)
 - [What is in this repository](#what-is-in-this-repository)
 - [Live on devnet](#live-on-devnet)
 - [Build and test](#build-and-test)
@@ -53,11 +57,13 @@ This repository is the protocol: the on-chain program, the SDK, the desk service
 | At close: the market and the oracle price | Leverage |
 | | Liquidation price |
 | | PnL and payouts |
+| | Whether it is a perp, an option or a prediction |
+| | Strike and end date |
 
 The public side is enough for anyone to check that every position is fully funded and every payout is right. Two things to know:
 
 - The maker on the other side can see your position. It is their money against yours.
-- Moving money in or out of a private balance is public, like any token transfer. What happens while it is inside is what is hidden.
+- In the Rings pool amounts are sealed and addresses are not: every note names its owner. So a plain deposit or withdrawal shows which wallet pays which trading account. [The veil](#the-veil) is the way round that.
 
 <p align="center">
   <a href="https://app.darkring.io"><img src=".github/assets/desk.jpg" alt="The Darkring desk on devnet with two open positions" width="100%"></a>
@@ -105,14 +111,62 @@ sequenceDiagram
 
 The [docs](https://darkring.io/docs) explain all of this for traders, with a worked example.
 
+## Options and predictions
+
+The same deal with an end date. A maker locks collateral in a quote, the trader adds a premium to open, and one note holds both until it settles at the Pyth price.
+
+| | Pays the trader | The trader may settle | The maker may settle |
+| --- | --- | --- | --- |
+| **Call** | `size × (price − strike)` above the strike, up to what the note holds | Any time | From the end of the term |
+| **Put** | `size × (strike − price)` below the strike, up to what the note holds | Any time | From the end of the term |
+| **Above** | Everything, if the price is at or above the strike | From the end of the term | From the end of the term |
+| **Below** | Everything, if the price is below the strike | From the end of the term | From the end of the term |
+
+"From the end of the term" means an oracle price published at or after it. The program reads the price account's publish time and hands it to the proof as a public input; the proof compares it with the end date, which stays hidden with the kind, the strike and the premium. Nothing liquidates a dated contract: the premium is all the trader can lose.
+
+These are four circuits of their own (`option_quote`, `option_open`, `option_settle`, `option_cancel`) beside the four perp ones, which they leave untouched. A note's state commits its type, so a perp proof never opens an option's note.
+
+How a maker prices a contract is not on chain. The devnet makers use a lognormal model with a volatility per market ([`service/src/pricing.rs`](service/src/pricing.rs)).
+
+## The veil
+
+In the Rings pool a note's amount is sealed and its owner is not. Money that goes from a wallet to a trading account can be followed, even through a fresh address in between.
+
+A veil note is owned by one address of this program, the same for every veil note, and commits the hash of a secret:
+
+- **`veil_in`** moves an amount from the depositor's notes into a new veil note.
+- **`veil_out`** pays a veil note out, whole, to any owner, on a proof of knowing its secret.
+
+Spending a note publishes its nullifier and not which note it was. So the chain shows that somebody put money behind the veil, and later that some veil note was paid to some address, and cannot tell whether the two are the same money. The amounts are sealed on both sides.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as Wallet
+    participant O as One-time address
+    participant V as The veil
+    participant A as Trading account
+
+    W->>O: deposit, in the open
+    O->>V: veil_in (amount sealed)
+    Note over V: one note among the others there
+    V->>A: veil_out, on the secret (amount sealed, which note unknown)
+```
+
+A private deposit is those three steps; a private withdrawal is the same the other way round. The one-time address and the secret are derived from the account's key, so the browser can make them again.
+
+What it does not hide: the amount where it leaves or reaches the wallet, and the timing. A note hides among the other notes behind the veil at that moment, so with few of them a deposit can be matched to the note that comes out seconds later. The app lets a transfer rest behind the veil and be moved on later for that reason.
+
+A one-time address has no SOL, so the desk's relayer pays the fee for the steps it signs. The relayer signs only a deposit or a withdrawal it merely pays for ([`service/src/transfer.rs`](service/src/transfer.rs)). Whoever relays can link the two ends; the chain cannot.
+
 ## What is in this repository
 
 | Path | What it is |
 | --- | --- |
-| [`program/`](program) | The Solana program and its four circuits: quote, open, settle and cancel quote. It verifies its own proof and hands the shielded transfer to the Rings pool. It stores no state. |
-| [`sdk/`](sdk) | Rust SDK. Builds and proves each transaction, and finds a trader's quotes and a maker's positions. |
-| [`service/`](service) | The devnet desk: three makers quoting eleven markets, price history for the chart, and the HTTP API behind app.darkring.io. A trader's keys stay in the trader's browser, which proves its own trades; the service assembles and sends them. |
-| [`test/`](test) | End-to-end tests: `tests/perps.rs` against a local validator, `tests/devnet.rs` against devnet. |
+| [`program/`](program) | The Solana program and its ten circuits: quote, open, settle and cancel quote for a perp, the same four for an option or a prediction, and the veil's two. It verifies its own proof and hands the shielded transfer to the Rings pool. It stores no state. |
+| [`sdk/`](sdk) | Rust SDK. Builds and proves each transaction, and finds a trader's quotes, a maker's positions and contracts, and a depositor's veil notes. |
+| [`service/`](service) | The devnet desk: three makers quoting eleven markets, pricing options and settling them when they end, price history for the chart, the relayer, and the HTTP API behind app.darkring.io. A trader's keys stay in the trader's browser, which proves its own trades; the service assembles and sends them. |
+| [`test/`](test) | End-to-end tests: `tests/perps.rs` and `tests/dated.rs` (options, predictions and the veil) against a local validator, `tests/devnet.rs` against devnet. |
 | [`scripts/`](scripts) | Tool setup, the devnet deploy, devnet wallets, the desk launcher and the browser package build. Each script's header says what it needs. |
 | [`deploy/`](deploy) | The systemd unit for the desk service. |
 | [`docs/reference/`](docs/reference) | The design of the Rings swap example this program grew out of. |
@@ -138,10 +192,11 @@ scripts/setup-zk-tools.sh      # the Zolana CLI that matches the pinned SDK
 scripts/build-localnet.sh      # prover, indexer, local validator and pool program
 ```
 
-With those set, run a position's whole life against a local validator:
+With those set, run a position's whole life against a local validator, then an option's, a prediction's and a trip through the veil:
 
 ```sh
 cargo test --release -p perps-test --test perps
+cargo test --release -p perps-test --test dated
 ```
 
 The devnet run spends devnet SOL and is ignored by default. It needs a devnet RPC, a Rings indexer URL and the wallets `scripts/devnet-setup.sh` makes. The header of [`test/tests/devnet.rs`](test/tests/devnet.rs) lists them.
@@ -178,7 +233,9 @@ The service is handed the two finished proofs, puts them in the program's instru
 ## Not built yet
 
 - **Both proofs in the browser.** The program's proof is made in the trader's browser. The Rings pool's proof is made in Helius's enclave, which the trader has to trust with the notes that trade spends and creates.
-- **Deposits and withdrawals of your own tokens.** Accounts are funded with test dollars from a faucet.
+- **A relayer that is not ours.** A private deposit or withdrawal goes through the desk's relayer, which pays its fees and so can link its two ends. One a user chooses, paid from what it relays, is not built.
+- **Selling an option back.** A call or a put can be exercised for what it is worth at the price, or held to its end. It cannot be sold back for its time value.
+- **A price pinned to the end date.** A dated contract settles at the first oracle price published at or after its end that somebody submits, not at the price of that second.
 - **Open makers.** The three makers are ours. Who provides liquidity on mainnet is an open question.
 - **Funding.** There is no funding rate. Only the makers' pricing keeps quotes near spot.
 - **A trusted setup and an audit.** See the warning at the top.

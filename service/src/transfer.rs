@@ -18,7 +18,13 @@ use std::{thread::sleep, time::Duration};
 use anyhow::{anyhow, bail, ensure, Result};
 use serde_json::{json, Value};
 use solana_address::Address;
+use solana_keypair::Keypair;
+use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
+use spr_interface::instruction::{
+    instruction_data::transact::{InterfaceTransfer, TransactIxData},
+    tag,
+};
 
 /// The Rings pool, the associated token account program, and the compute
 /// budget: everything a deposit or a withdrawal calls.
@@ -95,6 +101,70 @@ pub fn checked(wire: &[u8], account: &Address) -> Result<VersionedTransaction> {
         "the transaction is not fully signed"
     );
     Ok(transaction)
+}
+
+/// A transaction whose fee the desk's relayer pays, signed by the relayer
+/// and ready to send: a deposit from a wallet to a one-time address, or a
+/// withdrawal from a one-time address to a wallet. Those are the two ends
+/// of a private deposit and a private withdrawal: the one-time address has
+/// no SOL of its own, and the trading account must not be seen paying for
+/// it.
+///
+/// The relayer's signature is on the whole transaction, so everything in it
+/// that could spend the relayer's own funds is refused. Beyond what
+/// [`checked`] asks, the relayer may be named only where a fee payer is: as
+/// the first account of a pool `transact` or of the instruction that makes
+/// a token account. It may not be the depositor of a deposit, and a
+/// `transact` it pays for may only withdraw: a deposit inside one would be
+/// paid from an account that signed, and the relayer signed.
+pub fn relayed(wire: &[u8], relayer: &Keypair) -> Result<Vec<u8>> {
+    let mut transaction = checked(wire, &relayer.pubkey())
+        .map_err(|error| anyhow!("{error}").context("a relayed transaction"))?;
+    let message = &transaction.message;
+    let keys = message.static_account_keys();
+    for instruction in message.instructions() {
+        let program = keys[usize::from(instruction.program_id_index)];
+        // Where the relayer, account 0 of the transaction, is named.
+        let named: Vec<usize> = instruction
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, account)| **account == 0)
+            .map(|(position, _)| position)
+            .collect();
+        let as_payer_only = named.iter().all(|position| *position == 0);
+        if program == ALLOWED[0] {
+            match instruction.data.split_first() {
+                Some((&tag::DEPOSIT, _)) => ensure!(
+                    named.is_empty(),
+                    "the relayer cannot be the one who deposits"
+                ),
+                Some((&tag::TRANSACT, data)) => {
+                    ensure!(as_payer_only, "the relayer only pays the fee");
+                    let transact = wincode::deserialize_exact::<TransactIxData>(data)
+                        .map_err(|_| anyhow!("that is not the pool's transact data"))?;
+                    ensure!(
+                        transact.interface_transfers.iter().all(|transfer| matches!(
+                            transfer,
+                            InterfaceTransfer::SplWithdrawal { .. }
+                        )),
+                        "a relayed transaction may only withdraw tokens"
+                    );
+                }
+                _ => bail!("the relayer only pays for deposits and withdrawals"),
+            }
+        } else if program == ALLOWED[1] {
+            ensure!(as_payer_only, "the relayer only pays the fee");
+        } else {
+            ensure!(named.is_empty(), "the relayer only pays the fee");
+        }
+    }
+    let signature = relayer.sign_message(&transaction.message.serialize());
+    *transaction
+        .signatures
+        .first_mut()
+        .ok_or_else(|| anyhow!("the transaction has no signature slots"))? = signature;
+    wincode::serialize(&transaction).map_err(|_| anyhow!("the transaction does not serialize"))
 }
 
 /// `bytes` in base64, the encoding a Solana node takes a transaction in.
@@ -247,6 +317,129 @@ mod tests {
         assert!(checked(&wire(ACCOUNT, &[], 1), &ACCOUNT).is_err());
         assert!(checked(b"not a transaction", &ACCOUNT).is_err());
         assert!(checked(&vec![0; MAX_WIRE + 1], &ACCOUNT).is_err());
+    }
+
+    /// A legacy transaction paid by `payer`, with one instruction of
+    /// `program` over the accounts at `accounts` (indexes into `keys`, where
+    /// the payer is 0) carrying `data`.
+    fn relay_wire(payer: &Keypair, program: Address, accounts: Vec<u8>, data: Vec<u8>) -> Vec<u8> {
+        let message = legacy::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            // The payer, another account, the program.
+            account_keys: vec![payer.pubkey(), OTHER, program],
+            recent_blockhash: Default::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 2,
+                accounts,
+                data,
+            }],
+        };
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::Legacy(message),
+        };
+        wincode::serialize(&transaction).expect("a transaction serializes")
+    }
+
+    /// The pool's transact data with these public transfers.
+    fn transact(transfers: Vec<InterfaceTransfer>) -> Vec<u8> {
+        use spr_interface::{
+            instruction::instruction_data::transact::{CircuitId, TransactProof},
+            N_PUBLIC_SLOTS,
+        };
+        let data = TransactIxData {
+            expiry_unix_ts: u64::MAX,
+            private_tx_hash: [1; 32],
+            circuit: CircuitId::ConfidentialSigner(1, 2, N_PUBLIC_SLOTS as u8),
+            tx_viewing_pk: [2; 33],
+            salt: [3; 16],
+            proof: TransactProof::zeroed(),
+            inputs: Vec::new(),
+            interface_transfers: transfers,
+            data_hash: None,
+            ring_data_hash: None,
+            outputs: Vec::new(),
+            messages: Vec::new(),
+            tree_contexts: Vec::new(),
+        };
+        let mut bytes = vec![tag::TRANSACT];
+        bytes.extend_from_slice(&wincode::serialize(&data).expect("transact data serializes"));
+        bytes
+    }
+
+    #[test]
+    fn the_relayer_signs_a_withdrawal_it_only_pays_for() {
+        let relayer = Keypair::new();
+        let withdrawal = transact(vec![InterfaceTransfer::SplWithdrawal {
+            amount: 5,
+            spl_interface_bump: 255,
+        }]);
+        // Named first among the pool's accounts, as the fee payer is.
+        let wire = relay_wire(&relayer, ALLOWED[0], vec![0, 1], withdrawal);
+        let signed = relayed(&wire, &relayer).expect("a withdrawal is relayed");
+        let transaction: VersionedTransaction = wincode::deserialize(&signed).unwrap();
+        assert!(transaction.signatures.first().unwrap().verify(
+            relayer.pubkey().as_array(),
+            &transaction.message.serialize()
+        ));
+        // A transfer with no public leg at all is fine too.
+        assert!(relayed(
+            &relay_wire(&relayer, ALLOWED[0], vec![0, 1], transact(Vec::new())),
+            &relayer
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_relayer_signs_a_deposit_somebody_else_makes() {
+        let relayer = Keypair::new();
+        let wire = relay_wire(&relayer, ALLOWED[0], vec![1], vec![tag::DEPOSIT, 9, 9]);
+        assert!(relayed(&wire, &relayer).is_ok());
+    }
+
+    #[test]
+    fn nothing_that_spends_the_relayers_own_money_is_signed() {
+        let relayer = Keypair::new();
+        let refused = |program, accounts, data: Vec<u8>| {
+            relayed(&relay_wire(&relayer, program, accounts, data), &relayer).is_err()
+        };
+        // The relayer as the depositor of a deposit.
+        assert!(refused(ALLOWED[0], vec![1, 0], vec![tag::DEPOSIT, 9, 9]));
+        // A deposit inside a transact the relayer pays for, of SOL or of
+        // tokens: it would be taken from an account that signed.
+        for transfer in [
+            InterfaceTransfer::SolDeposit { amount: 5 },
+            InterfaceTransfer::SplDeposit {
+                amount: 5,
+                spl_interface_bump: 255,
+            },
+            InterfaceTransfer::SolWithdrawal { amount: 5 },
+        ] {
+            assert!(refused(ALLOWED[0], vec![0, 1], transact(vec![transfer])));
+        }
+        // The relayer named anywhere but first in a transact.
+        assert!(refused(ALLOWED[0], vec![1, 0], transact(Vec::new())));
+        // Any other instruction of the pool, and data that is not transact
+        // data.
+        assert!(refused(ALLOWED[0], vec![0], vec![0xee]));
+        assert!(refused(ALLOWED[0], vec![0], vec![tag::TRANSACT, 1, 2, 3]));
+        assert!(refused(ALLOWED[0], vec![0], Vec::new()));
+        // Named by the compute budget, or second by the token account
+        // program.
+        assert!(refused(ALLOWED[2], vec![0], vec![2]));
+        assert!(refused(ALLOWED[1], vec![1, 0], vec![1]));
+        // Another program, or another fee payer.
+        assert!(refused(SYSTEM, vec![1], vec![2]));
+        let other = Keypair::new();
+        assert!(relayed(
+            &relay_wire(&other, ALLOWED[0], vec![1], vec![tag::DEPOSIT]),
+            &relayer
+        )
+        .is_err());
     }
 
     #[test]

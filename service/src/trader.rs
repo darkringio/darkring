@@ -23,8 +23,11 @@ use std::{
 
 use anyhow::{anyhow, bail, ensure, Result};
 use perps_sdk::{
-    instructions::{open::Open, settle::Settle},
-    state::{PositionUtxo, QuoteUtxo},
+    instructions::{
+        open::Open,
+        settle::Settle,
+        veil::{VeilIn, VeilOut},
+    },
     OpenProof, SettleProof,
 };
 use solana_address::Address;
@@ -40,8 +43,12 @@ use spr_user_registry_interface::{
 };
 
 use crate::{
-    chain::{market_of, now_ms, solana_keypair, Chain, Config, Laps, MAX_PRICE_AGE_SECS, USDC},
-    desk::{PositionView, QuoteView, Shared},
+    chain::{
+        market_of, now_ms, solana_keypair, solana_keypair_or_new, Chain, Config, Laps,
+        MAX_PRICE_AGE_SECS, USDC,
+    },
+    deal::{AnyPosition, AnyQuote},
+    desk::{hex, Shared},
     maker::{id_of, MakerJob},
     opening::opening,
     transfer, usage,
@@ -65,6 +72,35 @@ const OPEN_HEADROOM_SECS: i64 = 40;
 const TICK: Duration = Duration::from_secs(3);
 /// How long a browser has to sign a transaction it was sent.
 const SIGN_WAIT: Duration = Duration::from_secs(45);
+/// What the relayer is kept at, and topped up to: it pays the fees of the
+/// transactions a browser's one-time addresses sign, and holds no more than
+/// it needs for a few of them.
+const RELAYER_FLOOR: u64 = 10_000_000;
+const RELAYER_FLOAT: u64 = 40_000_000;
+/// How many transactions the relayer pays for in an hour, for one account
+/// and for everyone.
+const RELAYS_PER_ACCOUNT: usize = 24;
+const RELAYS_PER_HOUR: usize = 240;
+
+/// One step of moving money through the veil, proved by the account's
+/// browser.
+pub enum VeilStep {
+    /// `depositor` puts money behind the veil: the account itself, or a
+    /// one-time address of its browser's, whose fee the relayer then pays.
+    In {
+        depositor: Address,
+        viewing_pubkey: [u8; 33],
+        proof: Box<OpenProof>,
+        transact: Box<TransactIxData>,
+    },
+    /// A veil note is paid out to whoever the proof names. With `relay`
+    /// the relayer pays the fee, so the account is not seen to.
+    Out {
+        relay: bool,
+        proof: Box<OpenProof>,
+        transact: Box<TransactIxData>,
+    },
+}
 
 pub enum TraderJob {
     /// A browser opened a session for this account.
@@ -75,7 +111,7 @@ pub enum TraderJob {
     /// A maker posted this quote for the account, at `leaf` of the tree.
     Posted {
         account: String,
-        posted: Box<QuoteUtxo>,
+        posted: Box<AnyQuote>,
         leaf: u64,
         maker: usize,
         signature: String,
@@ -115,13 +151,35 @@ pub enum TraderJob {
         wallet: Address,
         wire: Vec<u8>,
     },
+    /// One step through the veil.
+    Veil {
+        account: String,
+        step: VeilStep,
+    },
+    /// The account's browser built a deposit to a one-time address or a
+    /// withdrawal from one, signed by everyone but the relayer: `wire` is
+    /// the whole transaction, whose fee the relayer pays.
+    Relay {
+        account: String,
+        kind: transfer::Kind,
+        amount: u64,
+        wallet: Address,
+        wire: Vec<u8>,
+    },
+    /// The account's browser asks where a veil note of its own sits in the
+    /// tree: it is picking up a private transfer that was interrupted.
+    Leaf {
+        account: String,
+        hash: [u8; 32],
+        reply: Sender<Option<u64>>,
+    },
     /// An open has landed: find the position's leaf in the tree, which the
     /// account's browser needs to close it and its maker to settle it.
     Located {
         account: String,
         quote_id: String,
         position_id: String,
-        position: Box<PositionUtxo>,
+        position: Box<AnyPosition>,
         maker: usize,
     },
     /// A maker settled this position.
@@ -133,7 +191,7 @@ pub enum TraderJob {
     Recovered {
         account: String,
         position_id: String,
-        position: Box<PositionUtxo>,
+        position: Box<AnyPosition>,
         leaf: u64,
         maker: usize,
     },
@@ -149,6 +207,9 @@ impl TraderJob {
             | Self::Close { account, .. }
             | Self::Faucet { account }
             | Self::Transfer { account, .. }
+            | Self::Veil { account, .. }
+            | Self::Relay { account, .. }
+            | Self::Leaf { account, .. }
             | Self::Located { account, .. }
             | Self::Liquidated { account, .. }
             | Self::Recovered { account, .. } => account,
@@ -164,6 +225,8 @@ impl TraderJob {
                 | Self::Close { .. }
                 | Self::Faucet { .. }
                 | Self::Transfer { .. }
+                | Self::Veil { .. }
+                | Self::Relay { .. }
         )
     }
 }
@@ -182,7 +245,9 @@ impl Signer for BrowserSigner {
     }
 
     fn try_sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
-        let id = self.shared.request_signature(&self.account, message);
+        let id = self
+            .shared
+            .request_signature(&self.account, &self.pubkey.to_string(), message);
         let deadline = Instant::now() + SIGN_WAIT;
         loop {
             if let Some(signature) = self.shared.signature(&self.account, id) {
@@ -210,7 +275,7 @@ impl Signer for BrowserSigner {
 }
 
 struct Position {
-    utxo: PositionUtxo,
+    utxo: AnyPosition,
     maker: usize,
 }
 
@@ -223,9 +288,11 @@ struct Seat {
     address: ShieldedAddress,
     signer: BrowserSigner,
     /// Each live quote, its leaf in the tree and its maker.
-    quotes: HashMap<String, (QuoteUtxo, u64, usize)>,
+    quotes: HashMap<String, (AnyQuote, u64, usize)>,
     positions: HashMap<String, Position>,
     last_faucet: Option<Instant>,
+    /// When the relayer last paid a fee for this account.
+    relays: Vec<Instant>,
 }
 
 struct Trader {
@@ -233,6 +300,11 @@ struct Trader {
     /// The Solana node deposits and withdrawals are sent through.
     rpc_url: String,
     deployer: Keypair,
+    /// Pays the fees of what a browser's one-time addresses sign. It holds
+    /// a little SOL and nothing else: see `transfer::relayed`.
+    relayer: Keypair,
+    /// When the relayer last paid a fee, for the hourly limit.
+    relays: Vec<Instant>,
     shared: Arc<Shared>,
     makers: Vec<Sender<MakerJob>>,
     /// This thread's own queue, for work that follows an action.
@@ -312,10 +384,19 @@ impl Trader {
     ) -> Result<Self> {
         let chain = Chain::connect(config)?;
         let deployer = solana_keypair(config, "devnet-deployer.json")?;
+        let relayer = solana_keypair_or_new(config, "devnet-relayer.json")?;
+        if let Err(error) = chain.refill_faucet(&deployer) {
+            eprintln!(
+                "trader: refilling the faucet: {}",
+                usage::scrub(&format!("{error:#}"))
+            );
+        }
         let mut trader = Self {
             chain,
             rpc_url: config.rpc_url.clone(),
             deployer,
+            relayer,
+            relays: Vec::new(),
             shared: Arc::clone(shared),
             makers: makers.to_vec(),
             own: own.clone(),
@@ -327,6 +408,7 @@ impl Trader {
             let mut desk = trader.shared.lock();
             desk.mint = trader.chain.mint.to_string();
             desk.asset_id = trader.chain.asset_id;
+            desk.relayer = trader.relayer.pubkey().to_string();
         }
         trader.tick();
         Ok(trader)
@@ -405,6 +487,23 @@ impl Trader {
             } => self.with_seat(&account, |trader, seat| {
                 trader.transfer(seat, kind, amount, wallet, &wire)
             }),
+            TraderJob::Veil { account, step } => {
+                self.with_seat(&account, |trader, seat| trader.veil(seat, step))
+            }
+            TraderJob::Relay {
+                account,
+                kind,
+                amount,
+                wallet,
+                wire,
+            } => self.with_seat(&account, |trader, seat| {
+                trader.relay(seat, kind, amount, wallet, &wire)
+            }),
+            TraderJob::Leaf { hash, reply, .. } => {
+                // An indexer that does not answer is a note not found yet.
+                let _ = reply.send(self.chain.leaf_now(hash).unwrap_or(None));
+                Ok(())
+            }
             TraderJob::Located {
                 account,
                 quote_id,
@@ -422,7 +521,7 @@ impl Trader {
                         .lock()
                         .book(&account)
                         .openings
-                        .insert(position_id.clone(), opening(&input, &position.terms.maker));
+                        .insert(position_id.clone(), opening(&input, position.maker()));
                 }
                 if let Some(sender) = self.makers.get(maker) {
                     let _ = sender.send(MakerJob::Opened {
@@ -464,7 +563,7 @@ impl Trader {
                     .lock()
                     .book(&account)
                     .openings
-                    .insert(position_id.clone(), opening(&input, &position.terms.maker));
+                    .insert(position_id.clone(), opening(&input, position.maker()));
                 seat.positions.insert(
                     position_id,
                     Position {
@@ -514,6 +613,7 @@ impl Trader {
             quotes: HashMap::new(),
             positions: HashMap::new(),
             last_faucet: None,
+            relays: Vec::new(),
         };
         self.grant_fees(&seat, FEE_FLOOR)?;
         self.register(&seat)?;
@@ -684,51 +784,38 @@ impl Trader {
         chain: &Chain,
         shared: &Shared,
         seat: &mut Seat,
-        posted: QuoteUtxo,
+        posted: AnyQuote,
         leaf: u64,
         maker: usize,
         signature: &str,
     ) -> Result<()> {
-        let terms = &posted.terms;
-        let market = market_of(&terms.feed_id)?;
+        let market = market_of(posted.feed_id())?;
         let input = posted.to_input_utxo(chain.tree_id, leaf)?;
         let id = id_of(&input.utxo_hash);
         let mut desk = shared.lock();
-        let view = QuoteView {
-            id: id.clone(),
-            market: market.symbol.into(),
-            maker: desk
-                .makers
+        let view = posted.view(
+            id.clone(),
+            market.symbol,
+            desk.makers
                 .get(maker)
                 .cloned()
                 .ok_or_else(|| anyhow!("no maker {maker}"))?,
-            side: if terms.trader_is_long {
-                "long"
-            } else {
-                "short"
-            }
-            .into(),
-            size: terms.size.to_string(),
-            entry_price: terms.entry_price.to_string(),
-            trader_margin: terms.trader_margin.to_string(),
-            maker_margin: posted.maker_margin.to_string(),
-            maintenance_margin: terms.maintenance_margin.to_string(),
-            expires_at: (terms.expiry as i64 - OPEN_HEADROOM_SECS).max(0) as u64 * 1000,
-            signature: signature.into(),
-        };
+            (posted.expiry() as i64 - OPEN_HEADROOM_SECS).max(0) as u64 * 1000,
+            signature,
+        );
         let book = desk.book(&seat.account);
         book.quotes.push(view);
         book.openings
-            .insert(id.clone(), opening(&input, &terms.maker));
+            .insert(id.clone(), opening(&input, posted.maker()));
         drop(desk);
         seat.quotes.insert(id, (posted, leaf, maker));
         Ok(())
     }
 
-    /// Sends the open the account's browser proved: both margins move into
-    /// one private position. The account's other quotes go off its book:
-    /// they were offers for the same trade, and their makers take the margin
-    /// back when they expire.
+    /// Sends the open the account's browser proved: what both sides put in
+    /// moves into one private position. The account's other quotes go off
+    /// its book: they were offers for the same trade, and their makers take
+    /// the margin back when they expire.
     fn open(
         &mut self,
         seat: &mut Seat,
@@ -737,7 +824,7 @@ impl Trader {
         transact: TransactIxData,
     ) -> Result<()> {
         let expired = || anyhow!("that quote has expired");
-        let (quote_utxo, quote_leaf_index, maker) =
+        let (quote, quote_leaf_index, maker) =
             seat.quotes.get(quote_id).cloned().ok_or_else(expired)?;
         let view = self
             .shared
@@ -748,26 +835,31 @@ impl Trader {
             .find(|view| view.id == quote_id)
             .cloned()
             .ok_or_else(expired)?;
-        let terms = &quote_utxo.terms;
         // The quote is the open's first input, and the open circuit fixes
         // the position to the quote's opening and that nullifier: the desk
         // knows the position without reading anything of the trader's.
-        let first_nullifier = quote_utxo
+        let first_nullifier = quote
             .to_input_utxo(self.chain.tree_id, quote_leaf_index)?
             .nullifier;
-        let opened = quote_utxo.derived_position(seat.address, &first_nullifier)?;
-        let instruction = Open {
+        let opened = quote.derived(seat.address, &first_nullifier)?;
+        let open = Open {
             payer: seat.pubkey,
-            maker: terms
-                .maker
+            maker: quote
+                .maker()
                 .solana_address()
                 .map_err(|e| anyhow!("maker address: {e:?}"))?,
-            viewing_pubkey: *terms.maker.viewing_pubkey.as_bytes(),
+            viewing_pubkey: *quote.maker().viewing_pubkey.as_bytes(),
             tree: self.chain.tree,
             open_proof: proof,
             spp_proof: transact,
-        }
-        .instruction()?;
+        };
+        // The same accounts and data either way: the tag says which proof
+        // the program checks.
+        let instruction = if quote.is_option() {
+            open.option_instruction()?
+        } else {
+            open.instruction()?
+        };
         self.shared.label(&seat.account, "Sending to Solana");
         let mut lap = Laps::start();
         let signature = self.chain.send(&seat.signer, instruction)?;
@@ -784,37 +876,21 @@ impl Trader {
             book.openings
                 .retain(|held, _| seat.positions.contains_key(held));
             let frame = book.positions.len() as u32 + 1;
-            book.positions.push(PositionView {
-                id: id.clone(),
+            book.positions.push(crate::desk::PositionView {
                 frame,
-                market: view.market.clone(),
-                maker: view.maker.clone(),
-                side: view.side.clone(),
-                size: view.size.clone(),
-                entry_price: view.entry_price.clone(),
-                trader_margin: view.trader_margin.clone(),
-                total: opened.total.to_string(),
-                maintenance_margin: view.maintenance_margin.clone(),
-                opened_at: now_ms(),
-                status: "open".into(),
-                settle_price: None,
-                payout: None,
-                settled_at: None,
-                open_signature: signature.to_string(),
-                settle_signature: None,
+                ..opened.view(
+                    id.clone(),
+                    &view.market,
+                    view.maker.clone(),
+                    &signature.to_string(),
+                )
             });
             book.log(
                 "open",
                 &seat.account,
                 Some(&view.maker.address),
                 None,
-                &[
-                    "size",
-                    "direction",
-                    "entry price",
-                    "both margins",
-                    "liquidation price",
-                ],
+                opened.sealed(),
                 &signature.to_string(),
             );
         });
@@ -856,27 +932,30 @@ impl Trader {
                 .ok_or_else(|| anyhow!("that position is not open"))?;
             (position.utxo.clone(), position.maker)
         };
-        let market = market_of(&utxo.terms.feed_id)?;
+        let market = market_of(utxo.feed_id())?;
         ensure!(
             market.oracles.contains(&oracle),
             "that is not a price account of {}",
             market.symbol
         );
         let payout = utxo.trader_payout(price);
-        let instruction = Settle {
+        let settle = Settle {
             payer: seat.pubkey,
             signer: seat.pubkey,
             oracle,
             maker: utxo
-                .terms
-                .maker
+                .maker()
                 .solana_address()
                 .map_err(|e| anyhow!("maker address: {e:?}"))?,
             tree: self.chain.tree,
             settle_proof: proof,
             spp_proof: transact,
-        }
-        .instruction()?;
+        };
+        let instruction = if utxo.is_option() {
+            settle.option_instruction()?
+        } else {
+            settle.instruction()?
+        };
         self.shared.label(&seat.account, "Sending to Solana");
         let mut lap = Laps::start();
         let signature = self.chain.send(&seat.signer, instruction)?;
@@ -914,6 +993,177 @@ impl Trader {
                 position_id: position_id.into(),
             });
         }
+        Ok(())
+    }
+
+    /// Counts one more transaction the relayer pays for on `seat`'s behalf,
+    /// or refuses when the hour's allowance is used. Tops the relayer up
+    /// when it is running low.
+    fn relaying(&mut self, seat: &mut Seat) -> Result<()> {
+        let hour = Duration::from_secs(3600);
+        seat.relays.retain(|at| at.elapsed() < hour);
+        self.relays.retain(|at| at.elapsed() < hour);
+        if seat.relays.len() >= RELAYS_PER_ACCOUNT || self.relays.len() >= RELAYS_PER_HOUR {
+            bail!("the desk has relayed all it will this hour; try again later");
+        }
+        if self.chain.client.rpc().get_balance(self.relayer.pubkey())? < RELAYER_FLOOR {
+            self.chain
+                .transfer_sol(&self.deployer, self.relayer.pubkey(), RELAYER_FLOAT)?;
+        }
+        seat.relays.push(Instant::now());
+        self.relays.push(Instant::now());
+        Ok(())
+    }
+
+    /// Sends one step through the veil the account's browser proved. What
+    /// it tells the browser afterwards is where the new veil note sits in
+    /// the tree, which paying it out needs.
+    fn veil(&mut self, seat: &mut Seat, step: VeilStep) -> Result<()> {
+        self.shared.label(&seat.account, "Sending to Solana");
+        match step {
+            VeilStep::In {
+                depositor,
+                viewing_pubkey,
+                proof,
+                transact,
+            } => {
+                // The veil note is the transaction's first output.
+                let note = transact
+                    .outputs
+                    .first()
+                    .map(|output| output.utxo_hash)
+                    .ok_or_else(|| anyhow!("that veil deposit has no note"))?;
+                let own = depositor == seat.pubkey;
+                let payer = if own {
+                    seat.pubkey
+                } else {
+                    self.relaying(seat)?;
+                    self.relayer.pubkey()
+                };
+                let instruction = VeilIn {
+                    payer,
+                    depositor,
+                    viewing_pubkey,
+                    tree: self.chain.tree,
+                    proof: *proof,
+                    spp_proof: *transact,
+                }
+                .instruction()?;
+                let signature = if own {
+                    self.chain.send(&seat.signer, instruction)?
+                } else {
+                    // The one-time address signs in the browser, which
+                    // holds its key; the relayer signs here.
+                    let one_time = BrowserSigner {
+                        shared: Arc::clone(&self.shared),
+                        account: seat.account.clone(),
+                        pubkey: depositor,
+                    };
+                    self.chain
+                        .send_signed(payer, &[&self.relayer, &one_time], instruction)?
+                };
+                let leaf = self.chain.leaf(note)?;
+                println!("trader: veil in for {}", seat.account);
+                self.shared.update(|desk| {
+                    desk.veil_in += 1;
+                    let book = desk.book(&seat.account);
+                    book.receipt = Some(serde_json::json!({
+                        "kind": "veil-in",
+                        "note": hex(&note),
+                        "leaf": leaf.to_string(),
+                        "signature": signature.to_string(),
+                    }));
+                    book.log(
+                        "veil-in",
+                        &depositor.to_string(),
+                        None,
+                        None,
+                        &["the amount", "who can take it out"],
+                        &signature.to_string(),
+                    );
+                });
+            }
+            VeilStep::Out {
+                relay,
+                proof,
+                transact,
+            } => {
+                let payer = if relay {
+                    self.relaying(seat)?;
+                    self.relayer.pubkey()
+                } else {
+                    seat.pubkey
+                };
+                let instruction = VeilOut {
+                    payer,
+                    tree: self.chain.tree,
+                    proof: *proof,
+                    spp_proof: *transact,
+                }
+                .instruction()?;
+                let signature = if relay {
+                    self.chain.send(&self.relayer, instruction)?
+                } else {
+                    self.chain.send(&seat.signer, instruction)?
+                };
+                println!("trader: veil out for {}", seat.account);
+                self.shared.update(|desk| {
+                    desk.veil_out += 1;
+                    let book = desk.book(&seat.account);
+                    book.receipt = Some(serde_json::json!({
+                        "kind": "veil-out",
+                        "signature": signature.to_string(),
+                    }));
+                    book.log(
+                        "veil-out",
+                        &payer.to_string(),
+                        None,
+                        None,
+                        &["the amount", "which note it was"],
+                        &signature.to_string(),
+                    );
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends a deposit to a one-time address, or a withdrawal from one,
+    /// that the account's browser built: the relayer pays the fee and signs
+    /// last, after `transfer::relayed` has checked that the transaction can
+    /// spend nothing of the relayer's but that fee.
+    fn relay(
+        &mut self,
+        seat: &mut Seat,
+        kind: transfer::Kind,
+        amount: u64,
+        wallet: Address,
+        wire: &[u8],
+    ) -> Result<()> {
+        let signed = transfer::relayed(wire, &self.relayer)?;
+        self.relaying(seat)?;
+        let signature = transfer::broadcast(&self.rpc_url, &signed)?;
+        println!(
+            "trader: relayed a {} of {:.2} for {}",
+            kind.name(),
+            amount as f64 / USDC as f64,
+            seat.account
+        );
+        self.shared.update(|desk| {
+            let book = desk.book(&seat.account);
+            book.receipt = Some(serde_json::json!({
+                "kind": kind.name(),
+                "signature": signature,
+            }));
+            // The trading account is named by neither side of it.
+            book.log_transfer(
+                kind.name(),
+                &self.relayer.pubkey().to_string(),
+                &wallet.to_string(),
+                amount,
+                &signature,
+            );
+        });
         Ok(())
     }
 

@@ -250,6 +250,30 @@ pub fn solana_keypair(config: &Config, name: &str) -> Result<Keypair> {
     Ok(Keypair::new_from_array(seed(config, name)?))
 }
 
+/// The keypair in the file `name`, which is made first if it is not there:
+/// for a key that holds nothing worth keeping, like the relayer's.
+pub fn solana_keypair_or_new(config: &Config, name: &str) -> Result<Keypair> {
+    let path = config.keys_dir.join(name);
+    if !path.exists() {
+        let mut seed = [0u8; 32];
+        std::io::Read::read_exact(
+            &mut std::fs::File::open("/dev/urandom").context("reading /dev/urandom")?,
+            &mut seed,
+        )?;
+        let keypair = Keypair::new_from_array(seed);
+        let mut bytes = seed.to_vec();
+        bytes.extend_from_slice(keypair.pubkey().as_array());
+        std::fs::write(&path, serde_json::to_string(&bytes)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    solana_keypair(config, name)
+}
+
 pub struct Chain {
     pub client: SprClient<SolanaRpc>,
     pub tree: Address,
@@ -303,6 +327,22 @@ impl Chain {
         )?)
     }
 
+    /// [`send`](Self::send) for a transaction more than one key signs:
+    /// `payer` pays, and every one of `signers` signs, the payer among them.
+    pub fn send_signed(
+        &self,
+        payer: Address,
+        signers: &[&dyn Signer],
+        ix: Instruction,
+    ) -> Result<Signature> {
+        Ok(self.client.rpc().create_and_send_transaction(
+            std::slice::from_ref(&ix),
+            payer,
+            signers,
+            ComputeBudgetConfig::new(TRANSACT_COMPUTE_UNIT_LIMIT),
+        )?)
+    }
+
     /// Where the output with this `hash` sits in the tree, once the indexer
     /// has the transaction that made it.
     ///
@@ -332,6 +372,20 @@ impl Chain {
             "the indexer did not pick up the transaction: {}",
             last.unwrap_or_else(|| "it has no proof for its output".into())
         ))
+    }
+
+    /// Where the output with this `hash` sits in the tree, if the indexer
+    /// has it now: one question, no waiting.
+    pub fn leaf_now(&self, hash: [u8; 32]) -> Result<Option<u64>> {
+        Ok(self
+            .client
+            .indexer()
+            .get_merkle_proofs(self.tree, vec![hash], None)
+            .map_err(|error| anyhow!("{error:?}"))?
+            .proofs
+            .into_iter()
+            .next()
+            .map(|proof| proof.leaf_index))
     }
 
     /// The transaction with this `signature`, as the indexer has it, once
@@ -438,7 +492,55 @@ fn newest(
         .max_by_key(|mark| mark.publish_time)
 }
 
+/// The faucet is refilled when the deployer holds less than this, with this
+/// much: the deployer is the test dollar's mint authority.
+const FAUCET_FLOOR: u64 = 1_000_000 * USDC;
+const FAUCET_REFILL: u64 = 50_000_000 * USDC;
+
 impl Chain {
+    /// Mints test dollars to the deployer when it is running out of them.
+    /// Every new account and every faucet request is paid from what the
+    /// deployer holds, and when that ran out once (2026-11-15) no new
+    /// account could be set up until somebody minted more by hand.
+    pub fn refill_faucet(&self, deployer: &Keypair) -> Result<()> {
+        let funding = pda::associated_token_address(&deployer.pubkey(), &self.mint);
+        // A token account holds its amount in bytes 64 to 72.
+        let held = self
+            .client
+            .rpc()
+            .get_account(funding)?
+            .and_then(|account| account.data.get(64..72)?.try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(|| anyhow!("the deployer has no account for the test dollar"))?;
+        if held >= FAUCET_FLOOR {
+            return Ok(());
+        }
+        // The token program's MintTo: its index, then the amount.
+        let mut data = vec![7u8];
+        data.extend_from_slice(&FAUCET_REFILL.to_le_bytes());
+        let instruction = Instruction {
+            program_id: pda::spl_token_program_id(),
+            accounts: vec![
+                AccountMeta::new(self.mint, false),
+                AccountMeta::new(funding, false),
+                AccountMeta::new_readonly(deployer.pubkey(), true),
+            ],
+            data,
+        };
+        self.client.rpc().create_and_send_transaction(
+            std::slice::from_ref(&instruction),
+            deployer.pubkey(),
+            &[deployer],
+            ComputeBudgetConfig::for_instruction_count(1),
+        )?;
+        println!(
+            "desk: the faucet held {:.0} test dollars; minted {:.0} more",
+            held as f64 / USDC as f64,
+            FAUCET_REFILL as f64 / USDC as f64
+        );
+        Ok(())
+    }
+
     /// Shields `amount` test dollars from the deployer's token account to
     /// `recipient`, and waits for the note to be indexed.
     pub fn shield(
@@ -447,6 +549,14 @@ impl Chain {
         recipient: &ShieldedAddress,
         amount: u64,
     ) -> Result<Signature> {
+        // A failed refill is not a reason to refuse: the deployer may still
+        // hold enough for this one.
+        if let Err(error) = self.refill_faucet(deployer) {
+            eprintln!(
+                "desk: refilling the faucet: {}",
+                usage::scrub(&format!("{error:#}"))
+            );
+        }
         let funding = pda::associated_token_address(&deployer.pubkey(), &self.mint);
         let deposit = Deposit::new(DepositParams {
             recipient,

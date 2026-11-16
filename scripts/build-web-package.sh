@@ -38,6 +38,6 @@ cd "$root"
 "$root/scripts/check-keys.sh" >&2
 
 echo "package: $out"
-for circuit in quote open settle cancel_quote; do
+for circuit in quote open settle cancel_quote option_quote option_open option_settle option_cancel veil_in veil_out; do
     echo "circuit $circuit: $artifacts/$circuit/{circuit.xbc,pk.bin,vk.bin,sources.json}"
 done

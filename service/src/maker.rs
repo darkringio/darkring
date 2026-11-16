@@ -1,6 +1,7 @@
 //! A maker: answers quote requests with a sealed quote on chain, takes back
-//! the margin of quotes nobody opened, and settles a position the moment the
-//! oracle price makes it liquidatable.
+//! the margin of quotes nobody opened, settles a perp the moment the oracle
+//! price makes it liquidatable, and settles a dated contract (an option or
+//! a prediction) at the first oracle price after its term ends.
 
 use std::{
     collections::HashSet,
@@ -12,17 +13,26 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use perps_sdk::{
-    index::{index_maker_positions, index_maker_quotes},
+    index::{
+        maker_option_quotes_among, maker_options_among, maker_positions_among, maker_quotes_among,
+        maker_transactions,
+    },
     instructions::{
-        cancel_quote::CancelQuoteTransactionParams, quote::QuoteTransactionParams,
+        cancel_quote::CancelQuoteTransactionParams,
+        option::{
+            OptionCancelTransactionParams, OptionQuoteTransactionParams,
+            OptionSettleTransactionParams,
+        },
+        quote::QuoteTransactionParams,
         settle::SettleTransactionParams,
     },
     shared::identity,
-    state::{PositionUtxo, QuoteTerms, QuoteUtxo},
+    state::{OptionQuoteTerms, QuoteTerms, KIND_ABOVE, KIND_CALL},
     SIZE_SCALE,
 };
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use spr_keypair::ShieldedAddress;
 
@@ -30,7 +40,9 @@ use crate::{
     chain::{
         market_of, now, now_ms, solana_keypair, Actor, Chain, Config, Laps, Mark, Market, USDC,
     },
-    desk::{MakerView, PositionView, Shared},
+    deal::{AnyPosition, AnyQuote},
+    desk::{MakerView, Shared},
+    pricing,
     trader::TraderJob,
     usage,
 };
@@ -53,15 +65,49 @@ pub struct MakerSpec {
     pub coverage_tenths: u64,
 }
 
+/// What an account asks a maker to quote.
+#[derive(Clone, Copy)]
+pub enum Ask {
+    /// A perp of `size` at `leverage`.
+    Perp {
+        long: bool,
+        size: u64,
+        leverage: u64,
+    },
+    /// A dated contract ending at `term_end`, struck at `strike`: a call or
+    /// a put of `size`, or a prediction the account stakes `stake` on.
+    Option {
+        kind: u8,
+        size: u64,
+        strike: u64,
+        stake: u64,
+        term_end: u64,
+    },
+}
+
+/// A quote a maker has worked out and not yet posted: its terms, and what
+/// the maker locks behind it.
+enum Draft {
+    Perp(QuoteTerms, u64),
+    Option(OptionQuoteTerms, u64),
+}
+
+impl Draft {
+    /// What the maker locks in the quote.
+    fn locked(&self) -> u64 {
+        match self {
+            Self::Perp(_, margin) | Self::Option(_, margin) => *margin,
+        }
+    }
+}
+
 pub enum MakerJob {
     /// `account` asked for a quote; `trader` is its address.
     Quote {
         account: String,
         market: &'static Market,
         trader: ShieldedAddress,
-        long: bool,
-        size: u64,
-        leverage: u64,
+        ask: Ask,
     },
     /// `account` has a session again: tell it what it has open here.
     Resend { account: String },
@@ -70,7 +116,7 @@ pub enum MakerJob {
         account: String,
         quote_id: String,
         position_id: String,
-        position: Box<PositionUtxo>,
+        position: Box<AnyPosition>,
         leaf: u64,
     },
     /// The trader settled.
@@ -87,7 +133,7 @@ struct Pending {
     id: String,
     /// The account the quote was for, when this run posted it.
     account: Option<String>,
-    quote: QuoteUtxo,
+    quote: AnyQuote,
     leaf: u64,
     attempts: u8,
 }
@@ -96,13 +142,13 @@ struct Held {
     id: String,
     /// The trader's Solana address: the account whose position this is.
     account: String,
-    position: PositionUtxo,
+    position: AnyPosition,
     leaf: u64,
 }
 
 /// The account a position belongs to: its trader's Solana address.
-fn account_of(position: &PositionUtxo) -> Result<String> {
-    Ok(position.terms.trader.solana_address()?.to_string())
+fn account_of(position: &AnyPosition) -> Result<String> {
+    Ok(position.trader().solana_address()?.to_string())
 }
 
 struct Maker {
@@ -159,11 +205,9 @@ pub fn run(
                 account,
                 market,
                 trader,
-                long,
-                size,
-                leverage,
+                ask,
             }) => {
-                if let Err(error) = maker.quote(&account, market, trader, long, size, leverage) {
+                if let Err(error) = maker.quote(&account, market, trader, ask) {
                     eprintln!(
                         "maker {name}: no quote: {}",
                         usage::scrub(&format!("{error:#}"))
@@ -238,64 +282,65 @@ impl Maker {
         Ok(maker)
     }
 
-    /// Finds what this maker left on chain before a restart: positions still
-    /// open against it, and quotes whose margin it has yet to take back.
+    /// Finds what this maker left on chain before a restart: positions and
+    /// dated contracts still open against it, and quotes whose margin it has
+    /// yet to take back. Everything of the maker's carries its authority's
+    /// tag, so its transactions are read once and searched four times.
     fn recover(&mut self) -> Result<()> {
         let client = &self.chain.client;
-        // A zero timeout is one pass; an empty pass is reported as a timeout.
-        let positions = index_maker_positions(
-            &self.actor.keypair,
-            &self.actor.wallet.registry,
-            client.indexer(),
-            client.rpc(),
-            Duration::ZERO,
-        )
-        .unwrap_or_default();
+        let registry = &self.actor.wallet.registry;
+        let transactions =
+            maker_transactions(&self.actor.keypair, client.indexer()).unwrap_or_default();
+        let mut found: Vec<(AnyPosition, u64)> = Vec::new();
+        if !transactions.is_empty() {
+            for position in maker_positions_among(
+                &self.actor.keypair,
+                registry,
+                client.indexer(),
+                client.rpc(),
+                &transactions,
+            )
+            .unwrap_or_default()
+            {
+                found.push((
+                    AnyPosition::Perp(position.position_utxo),
+                    position.leaf_index,
+                ));
+            }
+            for option in maker_options_among(
+                &self.actor.keypair,
+                registry,
+                client.indexer(),
+                client.rpc(),
+                &transactions,
+            )
+            .unwrap_or_default()
+            {
+                found.push((AnyPosition::Option(option.option_utxo), option.leaf_index));
+            }
+        }
         let mut open = Vec::new();
-        for found in positions {
-            let id = id_of(&found.position_utxo.hash(self.chain.tree_id)?);
-            let terms = &found.position_utxo.terms;
-            let account = account_of(&found.position_utxo)?;
-            let Ok(market) = market_of(&terms.feed_id) else {
+        for (position, leaf) in found {
+            let id = id_of(&position.hash(self.chain.tree_id)?);
+            let account = account_of(&position)?;
+            let Ok(market) = market_of(position.feed_id()) else {
                 continue;
             };
-            let view = PositionView {
-                id: id.clone(),
-                frame: 0,
-                market: market.symbol.into(),
-                maker: self.view.clone(),
-                side: if terms.trader_is_long {
-                    "long"
-                } else {
-                    "short"
-                }
-                .into(),
-                size: terms.size.to_string(),
-                entry_price: terms.entry_price.to_string(),
-                trader_margin: terms.trader_margin.to_string(),
-                total: found.position_utxo.total.to_string(),
-                maintenance_margin: terms.maintenance_margin.to_string(),
-                opened_at: now_ms(),
-                status: "open".into(),
-                settle_price: None,
-                payout: None,
-                settled_at: None,
-                open_signature: String::new(),
-                settle_signature: None,
-            };
+            let view = position.view(id.clone(), market.symbol, self.view.clone(), "");
             self.shared.update(|desk| {
                 let book = desk.book(&account);
                 if !book.positions.iter().any(|position| position.id == id) {
                     let frame = book.positions.len() as u32 + 1;
-                    book.positions.push(PositionView { frame, ..view });
+                    book.positions
+                        .push(crate::desk::PositionView { frame, ..view });
                 }
             });
             open.push(id.clone());
             self.held.push(Held {
                 id,
                 account,
-                position: found.position_utxo,
-                leaf: found.leaf_index,
+                position,
+                leaf,
             });
         }
         // A position the file calls open that is no longer on chain was
@@ -311,24 +356,28 @@ impl Maker {
             }
         });
 
-        let quotes = index_maker_quotes(
-            &self.actor.keypair,
-            &self.actor.wallet.registry,
-            client.indexer(),
-            Duration::ZERO,
-        )
-        .unwrap_or_default();
+        let mut quotes: Vec<(AnyQuote, u64)> = Vec::new();
+        for quote in
+            maker_quotes_among(&self.actor.keypair, registry, &transactions).unwrap_or_default()
+        {
+            quotes.push((AnyQuote::Perp(quote.quote_utxo), quote.leaf_index));
+        }
+        for quote in maker_option_quotes_among(&self.actor.keypair, registry, &transactions)
+            .unwrap_or_default()
+        {
+            quotes.push((AnyQuote::Option(quote.quote_utxo), quote.leaf_index));
+        }
         let closed = self.shared.lock().closed_quotes.clone();
-        for found in quotes {
-            let id = id_of(&found.quote_utxo.hash(self.chain.tree_id)?);
+        for (quote, leaf) in quotes {
+            let id = id_of(&quote.hash(self.chain.tree_id)?);
             if closed.contains(&id) {
                 continue;
             }
             self.pending.push(Pending {
                 id,
                 account: None,
-                quote: found.quote_utxo,
-                leaf: found.leaf_index,
+                quote,
+                leaf,
                 // Most of these were opened long ago: one try each.
                 attempts: CANCEL_ATTEMPTS - 1,
             });
@@ -350,66 +399,179 @@ impl Maker {
         }
     }
 
-    /// Posts a quote for `trader` at the oracle price, moved by this maker's
-    /// spread, and hands its opening to the trader's account.
+    /// Works out the quote this maker gives for `ask`: a perp at the oracle
+    /// price moved by its spread, or a dated contract priced by `pricing`.
+    fn draft(&self, market: &Market, trader: &ShieldedAddress, ask: Ask) -> Result<Draft> {
+        let mark = self.chain.mark(market)?.price;
+        let maker = self.actor.keypair.shielded_address()?;
+        let expiry = (now() + QUOTE_LIFETIME_SECS) as u64;
+        let designated = Some(identity(&trader.solana_address()?)?);
+        match ask {
+            Ask::Perp {
+                long,
+                size,
+                leverage,
+            } => {
+                let spread = mark / 10_000 * self.spec.spread_bps;
+                let entry_price = if long { mark + spread } else { mark - spread };
+                let notional =
+                    u64::try_from(size as u128 * entry_price as u128 / SIZE_SCALE as u128)?;
+                let trader_margin = notional / leverage.max(1);
+                let maker_margin = trader_margin / 10 * self.spec.coverage_tenths;
+                ensure!(
+                    trader_margin > 0 && maker_margin > 0,
+                    "the size is too small"
+                );
+                Ok(Draft::Perp(
+                    QuoteTerms {
+                        feed_id: market.feed,
+                        trader_is_long: long,
+                        size,
+                        entry_price,
+                        trader_margin,
+                        maintenance_margin: trader_margin / 5,
+                        maker,
+                        expiry,
+                        trader: designated,
+                    },
+                    maker_margin,
+                ))
+            }
+            Ask::Option {
+                kind,
+                size,
+                strike,
+                stake,
+                term_end,
+            } => {
+                // A price tick in dollars, and the contract in the model's
+                // units: dollars and seconds.
+                let tick = 10f64.powi(market.expo);
+                let spot = mark as f64 * tick;
+                let seconds = term_end as f64 - now() as f64;
+                ensure!(seconds >= 60.0, "that contract ends too soon");
+                let volatility = pricing::volatility(market.symbol);
+                let (premium, total) = if kind >= KIND_ABOVE {
+                    let chance = pricing::quoted_chance(
+                        spot,
+                        strike as f64 * tick,
+                        seconds,
+                        volatility,
+                        kind == KIND_ABOVE,
+                    );
+                    (stake, pricing::prediction_total(stake, chance))
+                } else {
+                    // How far past the strike the contract pays, in ticks: a
+                    // put cannot pay past a price of zero.
+                    let cap = (pricing::cap_distance(spot, seconds, volatility) / tick).round();
+                    let cap_ticks = if kind == KIND_CALL {
+                        cap as u64
+                    } else {
+                        (cap as u64).min(strike.saturating_sub(1))
+                    };
+                    let total =
+                        u64::try_from(size as u128 * cap_ticks as u128 / SIZE_SCALE as u128)?;
+                    let units = size as f64 / market.size_per_unit();
+                    let per_unit = pricing::premium_per_unit(
+                        spot,
+                        strike as f64 * tick,
+                        cap_ticks as f64 * tick,
+                        seconds,
+                        volatility,
+                        kind == KIND_CALL,
+                    );
+                    ((per_unit * units * USDC as f64).ceil() as u64, total)
+                };
+                ensure!(
+                    premium as f64 >= pricing::MIN_PREMIUM_USD * USDC as f64,
+                    "that contract costs less than a dollar; make it larger"
+                );
+                ensure!(
+                    total as f64 <= pricing::MAX_PAYOUT_USD * USDC as f64,
+                    "that contract could pay more than {:.0} dollars; make it smaller",
+                    pricing::MAX_PAYOUT_USD
+                );
+                ensure!(
+                    premium < total,
+                    "that strike is so far in the money the contract would cost all it can pay"
+                );
+                Ok(Draft::Option(
+                    OptionQuoteTerms {
+                        feed_id: market.feed,
+                        kind,
+                        size,
+                        strike,
+                        premium,
+                        term_end,
+                        maker,
+                        expiry,
+                        trader: designated,
+                    },
+                    total - premium,
+                ))
+            }
+        }
+    }
+
+    /// Posts the quote this maker gives `trader` for `ask`, and hands its
+    /// opening to the trader's account.
     fn quote(
         &mut self,
         account: &str,
         market: &Market,
         trader: ShieldedAddress,
-        long: bool,
-        size: u64,
-        leverage: u64,
+        ask: Ask,
     ) -> Result<()> {
-        let mark = self.chain.mark(market)?.price;
-        let spread = mark / 10_000 * self.spec.spread_bps;
-        let entry_price = if long { mark + spread } else { mark - spread };
-        let notional = u64::try_from(size as u128 * entry_price as u128 / SIZE_SCALE as u128)?;
-        let trader_margin = notional / leverage.max(1);
-        let maker_margin = trader_margin / 10 * self.spec.coverage_tenths;
-        anyhow::ensure!(
-            trader_margin > 0 && maker_margin > 0,
-            "the size is too small"
-        );
+        let draft = self.draft(market, &trader, ask)?;
+        let locked = draft.locked();
 
         let mut lap = Laps::start();
         let asked = usage::indexer_requests();
-        let source = match self.actor.note(&self.chain, maker_margin, &self.used) {
+        let source = match self.actor.note(&self.chain, locked, &self.used) {
             Ok(source) => source,
             // Every note this maker knows of is used or too small: the
             // change from its earlier quotes, and what closed positions
             // paid it, are notes it has not read yet.
             Err(_) => {
                 self.refresh()?;
-                self.actor.note(&self.chain, maker_margin, &self.used)?
+                self.actor.note(&self.chain, locked, &self.used)?
             }
         };
         let spending = source.utxo_hash;
         lap.mark("notes");
-        let terms = QuoteTerms {
-            feed_id: market.feed,
-            trader_is_long: long,
-            size,
-            entry_price,
-            trader_margin,
-            maintenance_margin: trader_margin / 5,
-            maker: self.actor.keypair.shielded_address()?,
-            expiry: (now() + QUOTE_LIFETIME_SECS) as u64,
-            trader: Some(identity(&trader.solana_address()?)?),
-        };
-        let transaction = QuoteTransactionParams {
-            terms,
-            maker_margin,
-            source,
-            trader_address: trader,
-            payer: self.actor.pubkey,
-        }
-        .build(&self.actor.keypair)?;
-        let posted = transaction.quote_utxo.clone();
         let client = &self.chain.client;
-        let instruction = transaction
-            .prove(client.indexer(), self.chain.tree, &self.actor.keypair)?
-            .instruction()?;
+        let (posted, instruction): (AnyQuote, Instruction) = match draft {
+            Draft::Perp(terms, maker_margin) => {
+                let transaction = QuoteTransactionParams {
+                    terms,
+                    maker_margin,
+                    source,
+                    trader_address: trader,
+                    payer: self.actor.pubkey,
+                }
+                .build(&self.actor.keypair)?;
+                let posted = AnyQuote::Perp(transaction.quote_utxo.clone());
+                let instruction = transaction
+                    .prove(client.indexer(), self.chain.tree, &self.actor.keypair)?
+                    .instruction()?;
+                (posted, instruction)
+            }
+            Draft::Option(terms, collateral) => {
+                let transaction = OptionQuoteTransactionParams {
+                    terms,
+                    collateral,
+                    source,
+                    trader_address: trader,
+                    payer: self.actor.pubkey,
+                }
+                .build(&self.actor.keypair)?;
+                let posted = AnyQuote::Option(transaction.quote_utxo.clone());
+                let instruction = transaction
+                    .prove(client.indexer(), self.chain.tree, &self.actor.keypair)?
+                    .option_instruction()?;
+                (posted, instruction)
+            }
+        };
         lap.mark("prove");
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
         self.used.insert(spending);
@@ -471,7 +633,7 @@ impl Maker {
             return;
         }
         self.reclaim();
-        self.liquidate();
+        self.settle_due();
     }
 
     /// Reads the maker's notes from the indexer. A note stays in `used`
@@ -488,7 +650,7 @@ impl Maker {
     fn reclaim(&mut self) {
         let now = now();
         let due: Vec<usize> = (0..self.pending.len())
-            .filter(|&index| self.pending[index].quote.terms.expiry as i64 + 8 < now)
+            .filter(|&index| self.pending[index].quote.expiry() as i64 + 8 < now)
             .collect();
         for index in due.into_iter().rev() {
             match self.cancel(index) {
@@ -515,16 +677,27 @@ impl Maker {
     fn cancel(&mut self, index: usize) -> Result<()> {
         let pending = &self.pending[index];
         println!("maker {}: reclaiming quote {}", self.spec.name, pending.id);
-        let transaction = CancelQuoteTransactionParams {
-            quote_utxo: pending.quote.clone(),
-            quote_leaf_index: pending.leaf,
-            payer: self.actor.pubkey,
-            tree_id: self.chain.tree_id,
-        }
-        .build(&self.actor.keypair)?;
-        let instruction = transaction
-            .prove(self.chain.client.indexer(), self.chain.tree)?
-            .instruction()?;
+        let indexer = self.chain.client.indexer();
+        let instruction = match &pending.quote {
+            AnyQuote::Perp(quote) => CancelQuoteTransactionParams {
+                quote_utxo: quote.clone(),
+                quote_leaf_index: pending.leaf,
+                payer: self.actor.pubkey,
+                tree_id: self.chain.tree_id,
+            }
+            .build(&self.actor.keypair)?
+            .prove(indexer, self.chain.tree)?
+            .instruction()?,
+            AnyQuote::Option(quote) => OptionCancelTransactionParams {
+                quote_utxo: quote.clone(),
+                quote_leaf_index: pending.leaf,
+                payer: self.actor.pubkey,
+                tree_id: self.chain.tree_id,
+            }
+            .build(&self.actor.keypair)?
+            .prove(indexer, self.chain.tree)?
+            .option_instruction()?,
+        };
         // The margin comes back as a new note. Nothing here needs it
         // indexed: the maker finds it the next time it reads its notes.
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
@@ -543,33 +716,46 @@ impl Maker {
         Ok(())
     }
 
-    /// Settles every position the oracle price has made liquidatable.
-    fn liquidate(&mut self) {
+    /// Settles what this maker may settle now: every perp the oracle price
+    /// has made liquidatable, and every dated contract whose term has ended.
+    fn settle_due(&mut self) {
         if self.held.is_empty() {
             return;
         }
         // The prices the desk already reads say which positions are worth
-        // a look, so a position that is nowhere near its liquidation price
-        // costs no read of its own.
-        let seen: Vec<(String, u64)> = {
+        // a look, so one that is nowhere near being settled costs no read
+        // of its own.
+        let seen: Vec<(String, u64, i64)> = {
             let desk = self.shared.lock();
             desk.markets
                 .iter()
-                .filter_map(|view| Some((view.symbol.clone(), view.price.parse().ok()?)))
+                .filter_map(|view| {
+                    Some((
+                        view.symbol.clone(),
+                        view.price.parse().ok()?,
+                        view.publish_time,
+                    ))
+                })
                 .collect()
         };
-        // One fresh read of each market with a position to settle: the
+        // One fresh read of each market with something to settle: the
         // settle is proved at the price the program will read.
         let mut prices: Vec<(&'static Market, Mark)> = Vec::new();
         let mut due = Vec::new();
         for (index, held) in self.held.iter().enumerate() {
-            let Ok(market) = market_of(&held.position.terms.feed_id) else {
+            let Ok(market) = market_of(held.position.feed_id()) else {
                 continue;
+            };
+            let may = |price: u64, publish_time: i64| match &held.position {
+                AnyPosition::Perp(position) => price > 0 && position.is_liquidatable(price),
+                AnyPosition::Option(option) => {
+                    publish_time > 0 && option.may_settle(false, publish_time as u64)
+                }
             };
             let near = seen
                 .iter()
-                .find(|(symbol, _)| symbol.as_str() == market.symbol)
-                .is_some_and(|(_, price)| *price > 0 && held.position.is_liquidatable(*price));
+                .find(|(symbol, _, _)| symbol.as_str() == market.symbol)
+                .is_some_and(|(_, price, publish_time)| may(*price, *publish_time));
             if !near {
                 continue;
             }
@@ -587,7 +773,7 @@ impl Maker {
                     mark
                 }
             };
-            if held.position.is_liquidatable(mark.price) {
+            if may(mark.price, mark.publish_time) {
                 due.push((index, market, mark));
             }
         }
@@ -613,7 +799,11 @@ impl Maker {
                         position_id: id,
                     });
                 }
-                Err(error) => eprintln!("maker {}: liquidating {id}: {error:#}", self.spec.name),
+                Err(error) => eprintln!(
+                    "maker {}: settling {id}: {}",
+                    self.spec.name,
+                    usage::scrub(&format!("{error:#}"))
+                ),
             }
         }
     }
@@ -621,28 +811,63 @@ impl Maker {
     fn settle(&mut self, index: usize, market: &Market, mark: Mark) -> Result<()> {
         let price = mark.price;
         let held = &self.held[index];
-        let transaction = SettleTransactionParams {
-            position_utxo: held.position.clone(),
-            position_leaf_index: held.leaf,
-            oracle: mark.account,
-            price,
-            payer: self.actor.pubkey,
-            tree_id: self.chain.tree_id,
-        }
-        .build(&self.actor.keypair)?;
-        let payout = transaction.trader_payout;
-        let instruction = transaction
-            .prove(self.chain.client.indexer(), self.chain.tree)?
-            .instruction()?;
+        let indexer = self.chain.client.indexer();
+        let (payout, instruction, status, sealed): (u64, Instruction, &str, &[&str]) =
+            match &held.position {
+                AnyPosition::Perp(position) => {
+                    let transaction = SettleTransactionParams {
+                        position_utxo: position.clone(),
+                        position_leaf_index: held.leaf,
+                        oracle: mark.account,
+                        price,
+                        payer: self.actor.pubkey,
+                        tree_id: self.chain.tree_id,
+                    }
+                    .build(&self.actor.keypair)?;
+                    (
+                        transaction.trader_payout,
+                        transaction.prove(indexer, self.chain.tree)?.instruction()?,
+                        "liquidated",
+                        &["both payouts", "why it could settle"],
+                    )
+                }
+                AnyPosition::Option(option) => {
+                    let Ok(publish_time) = u64::try_from(mark.publish_time) else {
+                        bail!("the oracle's publish time is before the epoch");
+                    };
+                    let transaction = OptionSettleTransactionParams {
+                        option_utxo: option.clone(),
+                        option_leaf_index: held.leaf,
+                        oracle: mark.account,
+                        price,
+                        publish_time,
+                        payer: self.actor.pubkey,
+                        tree_id: self.chain.tree_id,
+                    }
+                    .build(&self.actor.keypair)?;
+                    (
+                        transaction.trader_payout,
+                        transaction
+                            .prove(indexer, self.chain.tree)?
+                            .option_instruction()?,
+                        "expired",
+                        &["both payouts", "what the contract was"],
+                    )
+                }
+            };
         // The maker's share comes back as a new note, found the next time
         // it reads its notes.
         let signature = self.chain.send(&self.actor.keypair, instruction)?;
+        println!(
+            "maker {}: settled {} at {price}, {status}",
+            self.spec.name, held.id
+        );
         let id = held.id.clone();
         let account = held.account.clone();
         self.shared.update(|desk| {
             let book = desk.book(&account);
             if let Some(position) = book.positions.iter_mut().find(|position| position.id == id) {
-                position.status = "liquidated".into();
+                position.status = status.into();
                 position.settle_price = Some(price.to_string());
                 position.payout = Some(payout.to_string());
                 position.settled_at = Some(now_ms());
@@ -654,7 +879,7 @@ impl Maker {
                 &self.view.address,
                 None,
                 Some((market.symbol, price)),
-                &["both payouts", "why it could settle"],
+                sealed,
                 &signature.to_string(),
             );
         });

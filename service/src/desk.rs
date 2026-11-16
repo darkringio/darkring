@@ -54,10 +54,17 @@ pub struct MarketView {
     /// The last 24 hours, in dollars: the price a day ago, the high and the
     /// low. From the price history (`tape.rs`), not from the oracle.
     pub day: Option<[f64; 3]>,
+    /// The yearly volatility the makers price this market's options and
+    /// predictions at (`pricing.rs`).
+    pub volatility: f64,
 }
 
 fn sol() -> String {
     "SOL".into()
+}
+
+fn perp() -> String {
+    "perp".into()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,6 +73,13 @@ pub struct QuoteView {
     pub id: String,
     pub market: String,
     pub maker: MakerView,
+    /// `perp`, or a dated contract's kind: `call`, `put`, `above`, `below`.
+    /// A dated contract's strike is in `entry_price`, its premium in
+    /// `trader_margin` and its collateral in `maker_margin`.
+    pub kind: String,
+    /// When a dated contract's term ends, in unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub term_end: Option<u64>,
     pub side: String,
     pub size: String,
     pub entry_price: String,
@@ -87,6 +101,13 @@ pub struct PositionView {
     #[serde(default = "sol")]
     pub market: String,
     pub maker: MakerView,
+    /// `perp`, or a dated contract's kind, as in a [`QuoteView`]. Positions
+    /// recorded before there were dated contracts are perps.
+    #[serde(default = "perp")]
+    pub kind: String,
+    /// When a dated contract's term ends, in unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term_end: Option<u64>,
     pub side: String,
     pub size: String,
     pub entry_price: String,
@@ -95,7 +116,9 @@ pub struct PositionView {
     pub total: String,
     pub maintenance_margin: String,
     pub opened_at: u64,
-    /// `open`, `closed` (the trader settled) or `liquidated` (the maker did).
+    /// `open`, `closed` (the trader settled), `liquidated` (the maker
+    /// settled a perp) or `expired` (the maker settled a dated contract at
+    /// the end of its term).
     pub status: String,
     pub settle_price: Option<String>,
     pub payout: Option<String>,
@@ -109,7 +132,8 @@ pub struct PositionView {
 pub struct EventView {
     pub id: String,
     pub at: u64,
-    /// `quote`, `open`, `settle`, `reclaim`, `deposit` or `withdraw`.
+    /// `quote`, `open`, `settle`, `reclaim`, `deposit`, `withdraw`,
+    /// `veil-in` or `veil-out`.
     pub kind: String,
     /// The wallet that signed.
     pub actor: String,
@@ -156,6 +180,10 @@ pub struct SignRequest {
     pub id: u64,
     /// The transaction message, in hex.
     pub message: String,
+    /// The address whose key has to sign: the account's own, or a one-time
+    /// address the account's browser made for a private deposit or
+    /// withdrawal.
+    pub signer: String,
 }
 
 /// One trading account's side of the desk. The account's balance is not
@@ -179,6 +207,9 @@ pub struct Book {
     pub openings: HashMap<String, Value>,
     /// Whether the faucet has paid this account its first test dollars.
     pub funded: bool,
+    /// What the last step through the veil or the relayer left for the
+    /// browser to pick up: its signature, and where a new veil note sits.
+    pub receipt: Option<Value>,
     sequence: u64,
 }
 
@@ -208,6 +239,13 @@ pub struct Desk {
     pub closed_quotes: Vec<String>,
     /// Actors still connecting.
     pub booting: usize,
+    /// The address that pays the fees of the transactions a browser's
+    /// one-time addresses sign.
+    pub relayer: String,
+    /// How many notes have gone behind the veil through this desk, and how
+    /// many have been paid out: the difference is how many are there now.
+    pub veil_in: u64,
+    pub veil_out: u64,
     sessions: HashMap<String, Session>,
     next_sign: u64,
     /// When a browser last asked for the desk's state.
@@ -222,6 +260,8 @@ pub struct Desk {
 struct Saved {
     books: HashMap<String, SavedBook>,
     closed_quotes: Vec<String>,
+    veil_in: u64,
+    veil_out: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -264,6 +304,8 @@ impl Shared {
             desk: Mutex::new(Desk {
                 books,
                 closed_quotes: saved.closed_quotes,
+                veil_in: saved.veil_in,
+                veil_out: saved.veil_out,
                 ..desk
             }),
             file,
@@ -298,6 +340,13 @@ impl Shared {
             "markets": desk.markets,
             "maxPriceAge": desk.max_price_age,
             "makers": desk.makers,
+            // What the makers price a dated contract with, for the web app
+            // to show a price before anyone is asked for a quote.
+            "options": crate::pricing::params(),
+            // How many notes are behind the veil: the crowd a private
+            // deposit or withdrawal hides in.
+            "veil": { "notes": desk.veil_in.saturating_sub(desk.veil_out) },
+            "relayer": desk.relayer,
             "session": account.is_some(),
             "wallet": account.unwrap_or(""),
             "quotes": book.quotes,
@@ -308,6 +357,7 @@ impl Shared {
             "busy": book.busy,
             "error": book.error,
             "sign": book.sign,
+            "receipt": book.receipt,
         })
     }
 
@@ -332,6 +382,8 @@ impl Shared {
                 })
                 .collect(),
             closed_quotes: desk.closed_quotes.clone(),
+            veil_in: desk.veil_in,
+            veil_out: desk.veil_out,
         };
         drop(desk);
         if let Some(parent) = self.file.parent() {
@@ -363,9 +415,9 @@ impl Shared {
         }
     }
 
-    /// Asks `account`'s browser to sign `message`, and returns the request's
-    /// id.
-    pub fn request_signature(&self, account: &str, message: &[u8]) -> u64 {
+    /// Asks `account`'s browser to sign `message` with the key of `signer`,
+    /// and returns the request's id.
+    pub fn request_signature(&self, account: &str, signer: &str, message: &[u8]) -> u64 {
         let mut desk = self.lock();
         desk.next_sign += 1;
         let id = desk.next_sign;
@@ -374,6 +426,7 @@ impl Shared {
         book.sign = Some(SignRequest {
             id,
             message: hex(message),
+            signer: signer.into(),
         });
         id
     }

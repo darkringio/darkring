@@ -15,10 +15,16 @@
 //!   POST /api/logout
 //!   POST /api/sign     {"id":7,"signature":"<hex>"}
 //!   POST /api/quotes   {"market":"BTC","side":"long","amount":0.01,"leverage":8,"take":false}
+//!   POST /api/options  {"market":"SOL","kind":"above","strike":"<ticks>","term":3600,"stake":25}
+//!                      or, for a call or a put, "amount":1.5 in place of "stake"
 //!   POST /api/open     {"quoteId","proof":"<hex>","transact":"<hex>"}
 //!   POST /api/close    {"positionId","oracle","price","proof":"<hex>","transact":"<hex>"}
 //!   POST /api/faucet   shield another 5,000 test dollars to the account
 //!   POST /api/transfer {"kind":"deposit"|"withdraw","amount":"<base units>","wallet","transaction":"<hex>"}
+//!   POST /api/relay    the same, for a transaction the relayer pays for
+//!   POST /api/leaf     {"hash":"<hex>"}, where a veil note of the account's sits in the tree
+//!   POST /api/veil     {"step":"in","depositor","viewingPubkey":"<hex>","proof","transact"}
+//!                      or {"step":"out","relay":true,"proof","transact"}
 //!   any  /api/rings…   the Rings indexer and enclave prover at Helius
 //!   POST /api/rpc      a Solana node, for reads
 //!
@@ -30,9 +36,11 @@
 //! and prover requests the desk allows itself a day (see `usage`).
 
 mod chain;
+mod deal;
 mod desk;
 mod maker;
 mod opening;
+mod pricing;
 mod relay;
 mod tape;
 mod trader;
@@ -61,9 +69,10 @@ use spr_keypair::{PublicKey, ShieldedAddress, ShieldedKeypair, SigningKey};
 
 use crate::{
     chain::{market, markets, Config},
+    deal::kind_named,
     desk::{hex, unhex, unhex_vec, Busy, Desk, MakerView, MarketView, Shared},
-    maker::{MakerJob, MakerSpec},
-    trader::TraderJob,
+    maker::{Ask, MakerJob, MakerSpec},
+    trader::{TraderJob, VeilStep},
 };
 
 /// The three makers. Spread is how far each quotes from the mark; coverage
@@ -186,6 +195,7 @@ fn main() -> Result<()> {
             publish_time: 0,
             oracle: market.oracles[0].to_string(),
             day: None,
+            volatility: pricing::volatility(market.symbol),
         })
         .collect();
     desk.max_price_age = trader::max_price_age();
@@ -461,7 +471,7 @@ fn route(
         }
         // With the day's allowance used, only what closes a position goes on.
         if usage::standing() != usage::Standing::Open
-            && matches!(request.path, "/api/quotes" | "/api/faucet")
+            && matches!(request.path, "/api/quotes" | "/api/options" | "/api/faucet")
         {
             bail!(usage::CLOSING);
         }
@@ -539,11 +549,28 @@ fn route(
             bail!("the desk is still on your last request");
         }
         book.error = None;
+        book.receipt = None;
         book.busy = Some(busy);
         Ok(())
     };
 
     match request.path {
+        "/api/leaf" => {
+            let hash: [u8; 32] =
+                unhex(&text("hash")?).ok_or_else(|| anyhow!("hash is not 32 bytes of hex"))?;
+            let (reply, answer) = mpsc::channel();
+            trader
+                .send(TraderJob::Leaf {
+                    account: account.into(),
+                    hash,
+                    reply,
+                })
+                .map_err(gone)?;
+            let leaf = answer
+                .recv_timeout(Duration::from_secs(8))
+                .map_err(|_| anyhow!("the desk is busy; try again in a moment"))?;
+            return Ok(json!({ "leaf": leaf.map(|leaf| leaf.to_string()) }));
+        }
         "/api/logout" => {
             if let Some(token) = request.token {
                 shared.lock().close_session(token);
@@ -628,12 +655,120 @@ fn route(
                         account: account.into(),
                         market,
                         trader: address,
-                        long,
-                        size,
-                        leverage,
+                        ask: Ask::Perp {
+                            long,
+                            size,
+                            leverage,
+                        },
                     })
                     .map_err(gone)?;
             }
+        }
+        "/api/options" => {
+            let kind = kind_named(&text("kind")?)
+                .ok_or_else(|| anyhow!("kind is call, put, above or below"))?;
+            let symbol = text("market")?;
+            let market = market(&symbol).ok_or_else(|| anyhow!("no such market"))?;
+            let (mark, published) = shared
+                .lock()
+                .markets
+                .iter()
+                .find(|view| view.symbol == symbol)
+                .map(|view| (view.price.parse::<f64>().unwrap_or(0.0), view.publish_time))
+                .unwrap_or((0.0, 0));
+            let age = chain::now() - published;
+            if age > chain::SETTLE_PRICE_AGE_SECS || mark <= 0.0 {
+                bail!(
+                    "the {symbol} price has not updated for {} minutes, so {symbol} cannot be \
+                     traded until it does",
+                    age / 60
+                );
+            }
+            let strike = text("strike")?
+                .parse::<u64>()
+                .ok()
+                .filter(|strike| {
+                    let ratio = *strike as f64 / mark;
+                    (1.0 - pricing::STRIKE_RANGE..=1.0 + pricing::STRIKE_RANGE).contains(&ratio)
+                })
+                .ok_or_else(|| anyhow!("the strike is too far from the price"))?;
+            let term = body
+                .get("term")
+                .and_then(Value::as_u64)
+                .filter(|term| pricing::TERMS_SECS.contains(term))
+                .ok_or_else(|| anyhow!("no such term"))?;
+            let term_end = chain::now() as u64 + term;
+            // A prediction is sized by what is staked on it, a call or a
+            // put by how much of the asset it is on.
+            let (size, stake) = if kind >= perps_sdk::state::KIND_ABOVE {
+                let stake = body.get("stake").and_then(Value::as_f64).unwrap_or(0.0);
+                if !(pricing::MIN_PREMIUM_USD..=pricing::MAX_PAYOUT_USD).contains(&stake) {
+                    bail!("the stake is out of range");
+                }
+                (0, (stake * chain::USDC as f64).round() as u64)
+            } else {
+                let amount = body.get("amount").and_then(Value::as_f64).unwrap_or(0.0);
+                let notional = amount * mark * 10f64.powi(market.expo);
+                let size = (amount * market.size_per_unit()).round();
+                if !(amount > 0.0 && notional.is_finite() && notional <= MAX_NOTIONAL_USD)
+                    || !(size >= 1.0 && size < u64::MAX as f64)
+                {
+                    bail!("size out of range");
+                }
+                (size as u64, 0)
+            };
+            // One maker prices a contract: the others use the same model,
+            // and each quote is a transaction that locks a maker's money.
+            let maker = makers
+                .get(best_maker())
+                .ok_or_else(|| anyhow!("no maker"))?;
+            begin(Busy::new("quotes", "Asking for a price"))?;
+            {
+                let mut desk = shared.lock();
+                let book = desk.book(account);
+                book.quotes.clear();
+                book.awaiting_quotes = 1;
+            }
+            maker
+                .send(MakerJob::Quote {
+                    account: account.into(),
+                    market,
+                    trader: address,
+                    ask: Ask::Option {
+                        kind,
+                        size,
+                        strike,
+                        stake,
+                        term_end,
+                    },
+                })
+                .map_err(gone)?;
+        }
+        "/api/veil" => {
+            let (proof, transact) = proofs(&text("proof")?, &text("transact")?)?;
+            let step = match text("step")?.as_str() {
+                "in" => VeilStep::In {
+                    depositor: Address::from_str(&text("depositor")?)
+                        .map_err(|_| anyhow!("depositor is not a Solana address"))?,
+                    viewing_pubkey: unhex(&text("viewingPubkey")?)
+                        .ok_or_else(|| anyhow!("viewingPubkey is not 33 bytes of hex"))?,
+                    proof: Box::new(proof),
+                    transact: Box::new(transact),
+                },
+                "out" => VeilStep::Out {
+                    relay: body.get("relay").and_then(Value::as_bool).unwrap_or(false),
+                    proof: Box::new(proof),
+                    transact: Box::new(transact),
+                },
+                _ => bail!("step is in or out"),
+            };
+            begin(Busy::new("veil", "Sending to Solana"))?;
+            trader
+                .send(TraderJob::Veil {
+                    account: account.into(),
+                    step,
+                })
+                .map_err(gone)?;
         }
         "/api/open" => {
             let quote_id = text("quoteId")?;
@@ -690,6 +825,30 @@ fn route(
             begin(Busy::new(kind.name(), "Sending to Solana"))?;
             trader
                 .send(TraderJob::Transfer {
+                    account: account.into(),
+                    kind,
+                    amount,
+                    wallet,
+                    wire,
+                })
+                .map_err(gone)?;
+        }
+        "/api/relay" => {
+            let kind = transfer::Kind::named(&text("kind")?)
+                .ok_or_else(|| anyhow!("kind is deposit or withdraw"))?;
+            let amount = text("amount")?
+                .parse::<u64>()
+                .ok()
+                .filter(|amount| *amount > 0)
+                .ok_or_else(|| anyhow!("amount is not a number of base units"))?;
+            let wallet = Address::from_str(&text("wallet")?)
+                .map_err(|_| anyhow!("wallet is not a Solana address"))?;
+            let wire = unhex_vec(&text("transaction")?)
+                .filter(|wire| wire.len() <= transfer::MAX_WIRE)
+                .ok_or_else(|| anyhow!("transaction is not a transaction in hex"))?;
+            begin(Busy::new("relay", "Sending to Solana"))?;
+            trader
+                .send(TraderJob::Relay {
                     account: account.into(),
                     kind,
                     amount,

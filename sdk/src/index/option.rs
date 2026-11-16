@@ -121,6 +121,23 @@ pub fn index_maker_option_quotes<I: Rpc>(
     })
 }
 
+/// The maker's option quotes among `transactions`:
+/// [`index_maker_option_quotes`] over transactions already read
+/// ([`super::maker::maker_transactions`]).
+pub fn maker_option_quotes_among(
+    keypair: &ShieldedKeypair,
+    registry: &AssetRegistry,
+    transactions: &[ShieldedTransaction],
+) -> Result<Vec<MakerOptionQuote>> {
+    let mut found = Vec::new();
+    for tx in transactions {
+        if let Some(quote) = scan_maker_option_quote(tx, keypair, registry)? {
+            found.push(quote);
+        }
+    }
+    Ok(found)
+}
+
 /// Finds the open contracts against the maker's option quotes, leaving out
 /// those a settle has since spent. The trader each names is resolved in the
 /// user registry, and a contract whose trader is not registered there is
@@ -138,10 +155,27 @@ pub fn index_maker_options<I: Rpc, R: Rpc>(
     let tag = authority.confidential_view_tag();
     index_until(timeout, "maker options", || {
         let transactions = collect_transactions(tag, indexer)?;
+        maker_options_among(keypair, registry, indexer, rpc, &transactions)
+    })
+}
+
+/// The open contracts against the maker's option quotes among
+/// `transactions`: [`index_maker_options`] over transactions already read.
+pub fn maker_options_among<I: Rpc, R: Rpc>(
+    keypair: &ShieldedKeypair,
+    registry: &AssetRegistry,
+    indexer: &I,
+    rpc: &R,
+    transactions: &[ShieldedTransaction],
+) -> Result<Vec<MakerOption>> {
+    let maker_address = keypair.shielded_address().map_err(err)?;
+    let maker_pubkey = maker_address.solana_address().map_err(err)?;
+    let authority = maker_authority(&maker_pubkey);
+    {
         let options = authority
             .decrypt_data_utxos::<circuits::OptionTerms>(
                 &keypair.viewing_key,
-                &transactions,
+                transactions,
                 registry,
             )
             .map_err(err)?;
@@ -169,5 +203,5 @@ pub fn index_maker_options<I: Rpc, R: Rpc>(
             });
         }
         Ok(found)
-    })
+    }
 }

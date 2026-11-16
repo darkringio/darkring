@@ -109,6 +109,41 @@ pub fn index_maker_quotes<I: Rpc>(
     })
 }
 
+/// Every indexed transaction that carries the tag of the maker's authority
+/// PDA: its quotes and the positions opened against them, perp and option
+/// alike. One read of these serves [`maker_quotes_among`],
+/// [`maker_positions_among`] and their option counterparts, where each
+/// `index_*` function would read them again.
+pub fn maker_transactions<I: Rpc>(
+    keypair: &ShieldedKeypair,
+    indexer: &I,
+) -> Result<Vec<ShieldedTransaction>> {
+    let maker_pubkey = keypair
+        .shielded_address()
+        .and_then(|address| address.solana_address())
+        .map_err(err)?;
+    collect_transactions(
+        maker_authority(&maker_pubkey).confidential_view_tag(),
+        indexer,
+    )
+}
+
+/// The maker's quotes among `transactions`: [`index_maker_quotes`] over
+/// transactions already read.
+pub fn maker_quotes_among(
+    keypair: &ShieldedKeypair,
+    registry: &AssetRegistry,
+    transactions: &[ShieldedTransaction],
+) -> Result<Vec<MakerQuote>> {
+    let mut found = Vec::new();
+    for tx in transactions {
+        if let Some(quote) = scan_maker_quote(tx, keypair, registry)? {
+            found.push(quote);
+        }
+    }
+    Ok(found)
+}
+
 /// Finds the open positions against the maker's quotes. An open transaction
 /// encrypts the position UTXO, owned by the maker's authority PDA, to the
 /// maker's viewing key; positions a settle has since spent are left out. The
@@ -128,10 +163,29 @@ pub fn index_maker_positions<I: Rpc, R: Rpc>(
     let tag = authority.confidential_view_tag();
     index_until(timeout, "maker positions", || {
         let transactions = collect_transactions(tag, indexer)?;
+        maker_positions_among(keypair, registry, indexer, rpc, &transactions)
+    })
+}
+
+/// The open positions against the maker's quotes among `transactions`:
+/// [`index_maker_positions`] over transactions already read. The indexer is
+/// still asked which of them a settle has spent, and the registry who their
+/// traders are.
+pub fn maker_positions_among<I: Rpc, R: Rpc>(
+    keypair: &ShieldedKeypair,
+    registry: &AssetRegistry,
+    indexer: &I,
+    rpc: &R,
+    transactions: &[ShieldedTransaction],
+) -> Result<Vec<MakerPosition>> {
+    let maker_address = keypair.shielded_address().map_err(err)?;
+    let maker_pubkey = maker_address.solana_address().map_err(err)?;
+    let authority = maker_authority(&maker_pubkey);
+    {
         let positions = authority
             .decrypt_data_utxos::<circuits::PositionTerms>(
                 &keypair.viewing_key,
-                &transactions,
+                transactions,
                 registry,
             )
             .map_err(err)?;
@@ -163,5 +217,5 @@ pub fn index_maker_positions<I: Rpc, R: Rpc>(
             });
         }
         Ok(found)
-    })
+    }
 }
