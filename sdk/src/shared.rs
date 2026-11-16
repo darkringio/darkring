@@ -64,6 +64,21 @@ pub fn settle_blinding_seed(position_blinding: &[u8; 32]) -> Result<[u8; 32]> {
     blinding_seed(perps_program::SETTLE_BLINDING_DOMAIN, position_blinding)
 }
 
+/// The option open's blinding seed, `Poseidon(DOOP, quote_blinding)`, which
+/// the option open circuit enforces, as [`open_blinding_seed`] is for a perp.
+pub fn option_open_blinding_seed(quote_blinding: &[u8; 32]) -> Result<[u8; 32]> {
+    blinding_seed(perps_program::OPTION_OPEN_BLINDING_DOMAIN, quote_blinding)
+}
+
+/// The option settle's blinding seed, `Poseidon(DOST, option_blinding)`,
+/// which the option settle circuit enforces.
+pub fn option_settle_blinding_seed(option_blinding: &[u8; 32]) -> Result<[u8; 32]> {
+    blinding_seed(
+        perps_program::OPTION_SETTLE_BLINDING_DOMAIN,
+        option_blinding,
+    )
+}
+
 /// Proves an SPP transaction through `indexer`, which serves the Merkle
 /// proofs, completing the inputs with `authority`, and checks that the SPP
 /// proof covers the transaction the program proof covers.
@@ -121,7 +136,18 @@ pub(crate) fn spp_accounts(
     owner_signers: Vec<Address>,
     data: &TransactIxData,
 ) -> Vec<AccountMeta> {
-    let authority = maker_authority_pda(maker);
+    spp_accounts_of(maker_authority_pda(maker), payer, tree, owner_signers, data)
+}
+
+/// [`spp_accounts`] for any program PDA among the owner signers: `authority`
+/// does not sign at transaction entry, the program signs for it in the CPI.
+pub(crate) fn spp_accounts_of(
+    authority: Address,
+    payer: Address,
+    tree: Address,
+    owner_signers: Vec<Address>,
+    data: &TransactIxData,
+) -> Vec<AccountMeta> {
     let mut accounts = Transact {
         payer,
         input_trees: vec![tree],

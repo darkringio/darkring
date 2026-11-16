@@ -81,7 +81,7 @@ const _: () = assert!(SIZE_SCALE != 0 && SIZE_SCALE < (1 << 32));
 /// Written with 64-bit operations only. The circuit build accepts native
 /// `u64` arithmetic, but not 128-bit division, which compiles to a software
 /// routine that counts leading zeros of a witness.
-fn mul_div_scale(a: u64, b: u64) -> u64 {
+pub(super) fn mul_div_scale(a: u64, b: u64) -> u64 {
     const MASK: u64 = 0xFFFF_FFFF;
     let (a1, a0) = (a >> 32, a & MASK);
     let (b1, b0) = (b >> 32, b & MASK);

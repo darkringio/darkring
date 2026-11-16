@@ -15,10 +15,27 @@ pub enum CircuitId {
     Open,
     Settle,
     CancelQuote,
+    OptionQuote,
+    OptionOpen,
+    OptionSettle,
+    OptionCancel,
+    VeilIn,
+    VeilOut,
 }
 
 impl CircuitId {
-    pub const ALL: [Self; 4] = [Self::Quote, Self::Open, Self::Settle, Self::CancelQuote];
+    pub const ALL: [Self; 10] = [
+        Self::Quote,
+        Self::Open,
+        Self::Settle,
+        Self::CancelQuote,
+        Self::OptionQuote,
+        Self::OptionOpen,
+        Self::OptionSettle,
+        Self::OptionCancel,
+        Self::VeilIn,
+        Self::VeilOut,
+    ];
 
     /// The circuit's directory under [`keys_dir`]: `zolana zk compile` names
     /// it after the snake-cased program struct.
@@ -28,6 +45,12 @@ impl CircuitId {
             Self::Open => "open",
             Self::Settle => "settle",
             Self::CancelQuote => "cancel_quote",
+            Self::OptionQuote => "option_quote",
+            Self::OptionOpen => "option_open",
+            Self::OptionSettle => "option_settle",
+            Self::OptionCancel => "option_cancel",
+            Self::VeilIn => "veil_in",
+            Self::VeilOut => "veil_out",
         }
     }
 }

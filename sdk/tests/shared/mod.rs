@@ -4,8 +4,15 @@ use perps_program::circuits as circuit;
 use perps_sdk::{
     maker_authority,
     proof::CircuitId,
-    shared::{feed_halves, identity, open_blinding_seed, settle_blinding_seed},
-    state::{PositionTerms, PositionUtxo, QuoteTerms, QuoteUtxo},
+    shared::{
+        feed_halves, identity, open_blinding_seed, option_open_blinding_seed,
+        option_settle_blinding_seed, settle_blinding_seed,
+    },
+    state::{
+        claim_of, OptionQuoteTerms, OptionQuoteUtxo, OptionTerms, OptionUtxo, PositionTerms,
+        PositionUtxo, QuoteTerms, QuoteUtxo, VeilNoteUtxo,
+    },
+    veil_authority,
 };
 use solana_address::Address;
 use solana_keypair::Keypair;
@@ -55,7 +62,18 @@ macro_rules! program {
         pub type $name = Fixture<circuit::$name>;
     )*};
 }
-program!(Quote, Open, Settle, CancelQuote);
+program!(
+    Quote,
+    Open,
+    Settle,
+    CancelQuote,
+    OptionQuote,
+    OptionOpen,
+    OptionSettle,
+    OptionCancel,
+    VeilIn,
+    VeilOut
+);
 
 /// A program's inputs and the native records they were converted from.
 pub struct Fixture<P> {
@@ -443,4 +461,322 @@ pub fn assert_invalid<P: Execute>(id: CircuitId, inputs: &Fixture<P>) {
         error.to_string().contains("program.execute()"),
         "expected the program's constraint to fail before the outer public-hash check: {error}"
     );
+}
+
+// Dated contracts: options and predictions.
+
+/// What the trader pays for the fixture contract, and what the maker locks.
+pub const PREMIUM: u64 = 4 * USDC;
+pub const COLLATERAL: u64 = 26 * USDC;
+/// The strike of the fixture contract.
+pub const STRIKE: u64 = 100 * USD;
+/// The end of the fixture contract's term, an hour after the quote expires.
+pub const TERM_END: u64 = EXPIRY + 3_600;
+pub const OPTION_LEAF_INDEX: u64 = 9;
+
+/// A quote of `kind` struck at [`STRIKE`] by `maker`: a call or a put of
+/// [`SIZE`], or a prediction.
+pub fn option_quote_terms(
+    maker: &ShieldedKeypair,
+    kind: u8,
+    trader: Option<[u8; 32]>,
+) -> OptionQuoteTerms {
+    OptionQuoteTerms {
+        feed_id: FEED_ID,
+        kind,
+        size: if kind >= perps_sdk::state::KIND_ABOVE {
+            0
+        } else {
+            SIZE
+        },
+        strike: STRIKE,
+        premium: PREMIUM,
+        term_end: TERM_END,
+        maker: maker.shielded_address().unwrap(),
+        expiry: EXPIRY,
+        trader,
+    }
+}
+
+pub fn option_quote_utxo(terms: OptionQuoteTerms) -> OptionQuoteUtxo {
+    OptionQuoteUtxo {
+        terms,
+        blinding: fe(7),
+        collateral_mint: collateral_mint(),
+        collateral: COLLATERAL,
+    }
+}
+
+/// An open contract of `kind` between `maker` and `trader`, holding the
+/// premium and the collateral.
+pub fn option_utxo(maker: &ShieldedKeypair, trader: &ShieldedKeypair, kind: u8) -> OptionUtxo {
+    let quote = option_quote_terms(maker, kind, None);
+    OptionUtxo {
+        terms: OptionTerms {
+            feed_id: quote.feed_id,
+            kind,
+            size: quote.size,
+            strike: quote.strike,
+            premium: quote.premium,
+            term_end: quote.term_end,
+            maker: quote.maker,
+            trader: trader.shielded_address().unwrap(),
+        },
+        blinding: fe(9),
+        collateral_mint: collateral_mint(),
+        total: PREMIUM + COLLATERAL,
+    }
+}
+
+/// An option quote of `kind` locking `collateral` of a `collateral + change`
+/// source owned by the maker, designated to and encrypted for a fresh trader.
+pub fn option_quote_inputs(kind: u8, collateral: u64, change: u64) -> OptionQuote {
+    let maker = keypair();
+    let trader = keypair();
+    let quote_address = authority_address(&maker, &trader);
+    let source = wallet_utxo(&maker, collateral_mint(), collateral + change);
+    let terms = option_quote_terms(&maker, kind, None);
+    let (feed_hi, feed_lo) = feed_halves(&FEED_ID);
+    let mut fixture = Fixture {
+        program: circuit::OptionQuote {
+            private: circuit::OptionQuotePrivateInputs {
+                tx_context: context(&fe(41)),
+                source: spr_program::circuit::Utxo::dummy(),
+                collateral,
+                feed_hi,
+                feed_lo,
+                kind,
+                size: terms.size,
+                strike: terms.strike,
+                premium: terms.premium,
+                term_end: terms.term_end,
+                expiry: EXPIRY,
+                taker_pk_fe: identity_of(&trader),
+            },
+            public: circuit::OptionQuotePublicInputs {
+                maker_owner_pk_field: identity_field(&maker),
+                quote_owner: spr_program::ShieldedAddress::default(),
+            },
+        },
+        records: InputRecords::new(),
+        sender: maker,
+    };
+    fixture.program.private.source = fixture.utxo(&source);
+    fixture.program.public.quote_owner = fixture.address(quote_address);
+    fixture
+}
+
+/// An open of `quote` at [`QUOTE_LEAF_INDEX`] by `trader`, whose premium
+/// input holds `premium_input`, under the quote's option open blinding seed.
+pub fn option_open_inputs(
+    quote: &OptionQuoteUtxo,
+    trader: ShieldedKeypair,
+    premium_input: u64,
+) -> OptionOpen {
+    let quote_input = quote
+        .to_input_utxo(INPUT_TREE_ID, QUOTE_LEAF_INDEX)
+        .unwrap();
+    let trader_input = wallet_utxo(&trader, collateral_mint(), premium_input);
+    let option_address = quote
+        .terms
+        .maker_authority()
+        .unwrap()
+        .address(quote.terms.maker.viewing_pubkey)
+        .unwrap();
+    let mut fixture = Fixture {
+        program: circuit::OptionOpen {
+            private: circuit::OptionOpenPrivateInputs {
+                tx_context: context(&option_open_blinding_seed(&quote.blinding).unwrap()),
+                terms: circuit::OptionQuoteTerms::default(),
+                quote_utxo: spr_program::circuit::Utxo::dummy(),
+                trader_in: spr_program::circuit::Utxo::dummy(),
+            },
+            public: circuit::OptionOpenPublicInputs {
+                expiry: quote.terms.expiry,
+                first_nullifier: spr_program::from_bytes(&quote_input.nullifier).unwrap(),
+                option_owner: spr_program::ShieldedAddress::default(),
+            },
+        },
+        records: InputRecords::new(),
+        sender: trader,
+    };
+    fixture.program.private.terms = circuit::OptionQuoteTerms::from_client(
+        quote.terms.circuit_terms().unwrap(),
+        &mut fixture.records,
+    )
+    .unwrap();
+    fixture.program.private.quote_utxo = fixture.utxo(&quote_input);
+    fixture.program.private.trader_in = fixture.utxo(&trader_input);
+    fixture.program.public.option_owner = fixture.address(option_address);
+    fixture
+}
+
+/// A settle of `option` at [`OPTION_LEAF_INDEX`] by `settler` at `price`,
+/// published at `publish_time`, under the contract's settle blinding seed.
+pub fn option_settle_inputs(
+    option: &OptionUtxo,
+    settler: ShieldedKeypair,
+    price: u64,
+    publish_time: u64,
+) -> OptionSettle {
+    let option_input = option
+        .to_input_utxo(INPUT_TREE_ID, OPTION_LEAF_INDEX)
+        .unwrap();
+    let (feed_hi, feed_lo) = feed_halves(&option.terms.feed_id);
+    let mut fixture = Fixture {
+        program: circuit::OptionSettle {
+            private: circuit::OptionSettlePrivateInputs {
+                tx_context: context(&option_settle_blinding_seed(&option.blinding).unwrap()),
+                terms: circuit::OptionTerms::default(),
+                option_utxo: spr_program::circuit::Utxo::dummy(),
+                trader_address: spr_program::ShieldedAddress::default(),
+                maker_address: spr_program::ShieldedAddress::default(),
+            },
+            public: circuit::OptionSettlePublicInputs {
+                feed_hi,
+                feed_lo,
+                price,
+                publish_time,
+                signer_owner_pk_field: identity_field(&settler),
+                first_nullifier: spr_program::from_bytes(&option_input.nullifier).unwrap(),
+            },
+        },
+        records: InputRecords::new(),
+        sender: settler,
+    };
+    fixture.program.private.terms = circuit::OptionTerms::from_client(
+        option.terms.circuit_terms().unwrap(),
+        &mut fixture.records,
+    )
+    .unwrap();
+    fixture.program.private.option_utxo = fixture.utxo(&option_input);
+    fixture.program.private.trader_address = fixture.address(option.terms.trader);
+    fixture.program.private.maker_address = fixture.address(option.terms.maker);
+    fixture
+}
+
+/// A cancel of an open option quote of a fresh maker at [`QUOTE_LEAF_INDEX`].
+pub fn option_cancel_inputs() -> OptionCancel {
+    let maker = keypair();
+    let quote = option_quote_utxo(option_quote_terms(&maker, 0, None));
+    let quote_input = quote
+        .to_input_utxo(INPUT_TREE_ID, QUOTE_LEAF_INDEX)
+        .unwrap();
+    let mut fixture = Fixture {
+        program: circuit::OptionCancel {
+            private: circuit::OptionCancelPrivateInputs {
+                tx_context: context(&fe(43)),
+                terms: circuit::OptionQuoteTerms::default(),
+                quote_utxo: spr_program::circuit::Utxo::dummy(),
+            },
+            public: circuit::OptionCancelPublicInputs {
+                expiry: EXPIRY,
+                maker_owner_pk_field: identity_field(&maker),
+            },
+        },
+        records: InputRecords::new(),
+        sender: maker,
+    };
+    fixture.program.private.terms = circuit::OptionQuoteTerms::from_client(
+        quote.terms.circuit_terms().unwrap(),
+        &mut fixture.records,
+    )
+    .unwrap();
+    fixture.program.private.quote_utxo = fixture.utxo(&quote_input);
+    fixture
+}
+
+// The veil.
+
+/// The secret of the fixture veil note, and where the note sits.
+pub const VEIL_SECRET: [u8; 32] = {
+    let mut secret = [0x5a; 32];
+    secret[0] = 0;
+    secret
+};
+pub const VEIL_LEAF_INDEX: u64 = 11;
+
+/// A veil note of `amount` behind [`VEIL_SECRET`].
+pub fn veil_note(amount: u64) -> VeilNoteUtxo {
+    VeilNoteUtxo {
+        claim: claim_of(&VEIL_SECRET).unwrap(),
+        blinding: fe(15),
+        mint: collateral_mint(),
+        amount,
+    }
+}
+
+/// A `veil_in` of `amount` by a fresh depositor from notes holding
+/// `sources`, behind [`VEIL_SECRET`].
+pub fn veil_in_inputs(amount: u64, sources: &[u64]) -> VeilIn {
+    let depositor = keypair();
+    let note_address = veil_authority()
+        .address(depositor.viewing_pubkey())
+        .unwrap();
+    let mut fixture = Fixture {
+        program: circuit::VeilIn {
+            private: circuit::VeilInPrivateInputs {
+                tx_context: context(&fe(45)),
+                sources: spr_program::ArrayVec::new(Vec::<spr_program::circuit::Utxo>::new())
+                    .unwrap(),
+                amount,
+                claim: claim_of(&VEIL_SECRET).unwrap(),
+            },
+            public: circuit::VeilInPublicInputs {
+                note_owner: spr_program::ShieldedAddress::default(),
+            },
+        },
+        records: InputRecords::new(),
+        sender: depositor,
+    };
+    let mut utxos = Vec::new();
+    for (index, held) in sources.iter().enumerate() {
+        let mut source = wallet_utxo(&fixture.sender, collateral_mint(), *held);
+        // Each note is its own leaf, with its own blinding.
+        source = spr_test_utils::utxo::wallet(
+            Utxo {
+                blinding: fe(20 + index as u8),
+                ..source.utxo
+            },
+            &fixture.sender.nullifier_key,
+            INPUT_TREE_ID,
+            6 + index as u64,
+            None,
+            None,
+        )
+        .unwrap();
+        utxos.push(fixture.utxo(&source));
+    }
+    fixture.program.private.sources = spr_program::ArrayVec::new(utxos).unwrap();
+    fixture.program.public.note_owner = fixture.address(note_address);
+    fixture
+}
+
+/// A `veil_out` of `note` at [`VEIL_LEAF_INDEX`] with `secret`, sent by a
+/// fresh sender and paid to `recipient`.
+pub fn veil_out_inputs(
+    note: &VeilNoteUtxo,
+    secret: &[u8; 32],
+    recipient: ShieldedAddress,
+) -> VeilOut {
+    let input = note.to_input_utxo(INPUT_TREE_ID, VEIL_LEAF_INDEX).unwrap();
+    let mut fixture = Fixture {
+        program: circuit::VeilOut {
+            private: circuit::VeilOutPrivateInputs {
+                tx_context: context(&fe(47)),
+                terms: circuit::VeilNote { claim: note.claim },
+                note_utxo: spr_program::circuit::Utxo::dummy(),
+                secret: spr_program::from_bytes(secret).unwrap(),
+                recipient: spr_program::ShieldedAddress::default(),
+            },
+            public: circuit::VeilOutPublicInputs {
+                first_nullifier: spr_program::from_bytes(&input.nullifier).unwrap(),
+            },
+        },
+        records: InputRecords::new(),
+        sender: keypair(),
+    };
+    fixture.program.private.note_utxo = fixture.utxo(&input);
+    fixture.program.private.recipient = fixture.address(recipient);
+    fixture
 }

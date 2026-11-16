@@ -50,10 +50,32 @@ pub enum Wrapper {
     Open,
     Settle,
     CancelQuote,
+    OptionQuote,
+    OptionOpen,
+    OptionSettle,
+    OptionCancel,
 }
 
 impl Wrapper {
-    pub const ALL: [Self; 4] = [Self::Quote, Self::Open, Self::Settle, Self::CancelQuote];
+    pub const ALL: [Self; 8] = [
+        Self::Quote,
+        Self::Open,
+        Self::Settle,
+        Self::CancelQuote,
+        Self::OptionQuote,
+        Self::OptionOpen,
+        Self::OptionSettle,
+        Self::OptionCancel,
+    ];
+
+    /// The option instructions, each of which takes the accounts and the
+    /// data of its perp counterpart ([`Self::base`]).
+    pub const OPTIONS: [Self; 4] = [
+        Self::OptionQuote,
+        Self::OptionOpen,
+        Self::OptionSettle,
+        Self::OptionCancel,
+    ];
 
     pub fn tag(self) -> u8 {
         match self {
@@ -61,15 +83,29 @@ impl Wrapper {
             Self::Open => tag::OPEN,
             Self::Settle => tag::SETTLE,
             Self::CancelQuote => tag::CANCEL_QUOTE,
+            Self::OptionQuote => tag::OPTION_QUOTE,
+            Self::OptionOpen => tag::OPTION_OPEN,
+            Self::OptionSettle => tag::OPTION_SETTLE,
+            Self::OptionCancel => tag::OPTION_CANCEL,
+        }
+    }
+
+    /// The perp instruction whose accounts and data this one takes.
+    pub fn base(self) -> Self {
+        match self {
+            Self::Quote | Self::OptionQuote => Self::Quote,
+            Self::Open | Self::OptionOpen => Self::Open,
+            Self::Settle | Self::OptionSettle => Self::Settle,
+            Self::CancelQuote | Self::OptionCancel => Self::CancelQuote,
         }
     }
 
     /// The maker whose authority PDA the instruction signs for: quote's
     /// payer, the `maker` argument of open and settle, cancel's maker signer.
     fn authority_maker(self) -> [u8; 32] {
-        match self {
+        match self.base() {
             Self::Quote => PAYER,
-            Self::Open | Self::Settle | Self::CancelQuote => MAKER,
+            _ => MAKER,
         }
     }
 
@@ -198,7 +234,7 @@ pub fn valid_marker() -> MessageData {
 
 /// The fixture's transact data: a quote carries the valid marker.
 pub fn fixture_transact(wrapper: Wrapper) -> TransactIxData {
-    transact(if matches!(wrapper, Wrapper::Quote) {
+    transact(if matches!(wrapper.base(), Wrapper::Quote) {
         vec![valid_marker()]
     } else {
         Vec::new()
@@ -227,7 +263,7 @@ pub fn wrapper_data_with_bump(
         b: [11; 64],
         c: [12; 32],
     };
-    let body = match wrapper {
+    let body = match wrapper.base() {
         Wrapper::Quote => wincode::serialize(&QuoteIxData {
             proof,
             viewing_pubkey: [13; 33],
@@ -253,6 +289,7 @@ pub fn wrapper_data_with_bump(
             authority_bump,
             transact,
         }),
+        _ => unreachable!("base is a perp instruction"),
     }
     .expect("serialize wrapper");
     let mut data = vec![wrapper.tag()];
@@ -272,7 +309,7 @@ pub fn fixture(wrapper: Wrapper) -> (Instruction, Vec<(Pubkey, Account)>) {
 
     let mut metas = vec![AccountMeta::new(payer, true)];
     let mut accounts = vec![(payer, account(1_000_000_000))];
-    match wrapper {
+    match wrapper.base() {
         Wrapper::CancelQuote => {
             metas.push(AccountMeta::new_readonly(maker, true));
             accounts.push((maker, account(1_000_000_000)));
@@ -285,13 +322,13 @@ pub fn fixture(wrapper: Wrapper) -> (Instruction, Vec<(Pubkey, Account)>) {
             metas.push(AccountMeta::new_readonly(oracle, false));
             accounts.push((oracle, oracle_account(price_update(100, 0))));
         }
-        Wrapper::Quote | Wrapper::Open => {}
+        _ => {}
     }
     metas.push(AccountMeta::new(payer, true));
     accounts.push((payer, account(1_000_000_000)));
     metas.push(AccountMeta::new(tree, false));
     accounts.push((tree, account(1_000_000_000)));
-    if !matches!(wrapper, Wrapper::Quote) {
+    if !matches!(wrapper.base(), Wrapper::Quote) {
         metas.push(AccountMeta::new_readonly(authority, false));
         accounts.push((authority, account(1_000_000_000)));
     }
@@ -318,5 +355,99 @@ pub fn set_oracle(accounts: &mut [(Pubkey, Account)], oracle: Account) {
         if *key == address {
             *account = oracle.clone();
         }
+    }
+}
+
+/// The veil instructions' fixtures: `veil_in` and `veil_out` around the
+/// fixture transact, with the veil PDA among the accounts.
+pub mod veil {
+    use perps_program::{
+        instructions::veil::{VeilInIxData, VeilOutIxData},
+        VEIL_PDA_SEED,
+    };
+
+    use super::*;
+
+    pub fn canonical_bump() -> u8 {
+        Pubkey::find_program_address(&[VEIL_PDA_SEED], &program_id()).1
+    }
+
+    /// The highest bump that derives no program address.
+    pub fn invalid_bump() -> u8 {
+        (0..=u8::MAX)
+            .rev()
+            .find(|bump| {
+                Pubkey::create_program_address(&[VEIL_PDA_SEED, &[*bump]], &program_id()).is_err()
+            })
+            .expect("some bump derives an on-curve point")
+    }
+
+    fn proof() -> CompressedProof {
+        CompressedProof {
+            a: [10; 32],
+            b: [11; 64],
+            c: [12; 32],
+        }
+    }
+
+    pub fn in_data(transact: TransactIxData, authority_bump: u8) -> Vec<u8> {
+        let mut data = vec![tag::VEIL_IN];
+        data.extend_from_slice(
+            &wincode::serialize(&VeilInIxData {
+                proof: proof(),
+                viewing_pubkey: [13; 33],
+                authority_bump,
+                transact,
+            })
+            .expect("serialize veil_in"),
+        );
+        data
+    }
+
+    pub fn out_data(transact: TransactIxData, authority_bump: u8) -> Vec<u8> {
+        let mut data = vec![tag::VEIL_OUT];
+        data.extend_from_slice(
+            &wincode::serialize(&VeilOutIxData {
+                proof: proof(),
+                authority_bump,
+                transact,
+            })
+            .expect("serialize veil_out"),
+        );
+        data
+    }
+
+    /// An instruction with `data` and the accounts both veil instructions
+    /// take: the payer, then the SPP accounts with the veil PDA among them.
+    pub fn fixture(data: Vec<u8>) -> (Instruction, Vec<(Pubkey, Account)>) {
+        let payer = Pubkey::new_from_array(PAYER);
+        let tree = Pubkey::new_from_array([23; 32]);
+        let spp_id = Pubkey::new_from_array(SHIELDED_POOL_PROGRAM_ID);
+        let (authority, _) = Pubkey::find_program_address(&[VEIL_PDA_SEED], &program_id());
+        let metas = vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(payer, true),
+            AccountMeta::new(tree, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new_readonly(spp_id, false),
+        ];
+        let accounts = vec![
+            (payer, account(1_000_000_000)),
+            (payer, account(1_000_000_000)),
+            (tree, account(1_000_000_000)),
+            (authority, account(1_000_000_000)),
+            (
+                spp_id,
+                mollusk_svm::program::create_program_account_loader_v3(&spp_id),
+            ),
+        ];
+        (
+            Instruction {
+                program_id: program_id(),
+                accounts: metas,
+                data,
+            },
+            accounts,
+        )
     }
 }

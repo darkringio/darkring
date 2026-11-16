@@ -25,7 +25,7 @@ fn missing_instruction_tag_is_rejected_exactly() {
 #[test]
 fn unknown_instruction_tags_are_rejected_exactly() {
     let (mollusk, program_id) = setup_mollusk();
-    for tag in [0u8, 1, 6, 0xff] {
+    for tag in [0u8, 1, 12, 0xff] {
         let instruction = Instruction {
             program_id,
             accounts: Vec::new(),

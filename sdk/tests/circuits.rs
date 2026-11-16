@@ -3,9 +3,11 @@
 //! proofs with the committed verifiers.
 mod cancel_quote_circuit;
 mod open_circuit;
+mod option_circuit;
 mod quote_circuit;
 mod settle_circuit;
 mod shared;
+mod veil_circuit;
 
 #[test]
 fn circuits_encode_only_their_specified_utxo_inputs() {

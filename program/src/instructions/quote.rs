@@ -100,7 +100,7 @@ pub fn process_quote_ix(accounts: &mut [AccountView], data: &[u8]) -> ProgramRes
 
 /// The transaction carries exactly one message, whose data is the
 /// [`QuoteMarkerData`] of the quote output's hash and `maker_pubkey`.
-fn check_marker(transact: &TransactIxDataRef, maker_pubkey: [u8; 32]) -> ProgramResult {
+pub(super) fn check_marker(transact: &TransactIxDataRef, maker_pubkey: [u8; 32]) -> ProgramResult {
     let quote_utxo_hash = transact
         .outputs
         .get(QUOTE_OUTPUT_INDEX)

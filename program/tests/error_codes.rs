@@ -17,6 +17,8 @@ fn error_codes_are_stable() {
         (OracleNotFullyVerified as u32, 9012),
         (StaleOraclePrice as u32, 9013),
         (InvalidOraclePrice as u32, 9014),
+        (InvalidVeilBump as u32, 9015),
+        (MissingVeilAuthority as u32, 9016),
     ];
     for (got, want) in table {
         assert_eq!(got, want, "error code drifted");

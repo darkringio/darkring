@@ -23,7 +23,18 @@ pub struct Open {
 }
 
 impl Open {
+    /// The perp instruction.
     pub fn instruction(self) -> Result<Instruction> {
+        self.tagged(tag::OPEN)
+    }
+
+    /// The same accounts and data under the option program's tag: the
+    /// instruction of a dated contract, which verifies the option proof.
+    pub fn option_instruction(self) -> Result<Instruction> {
+        self.tagged(tag::OPTION_OPEN)
+    }
+
+    fn tagged(self, tag: u8) -> Result<Instruction> {
         let Self {
             payer,
             maker,
@@ -52,7 +63,7 @@ impl Open {
             transact: spp_proof,
         })
         .map_err(err)?;
-        let mut data = vec![tag::OPEN];
+        let mut data = vec![tag];
         data.extend_from_slice(&serialized_ix);
         Ok(Instruction {
             program_id: perps_program::ID,

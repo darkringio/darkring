@@ -19,7 +19,9 @@ use pinocchio::{address::address_eq, error::ProgramError, AccountView, Address, 
 
 #[cfg(all(not(feature = "build-circuits"), not(xark)))]
 use crate::instructions::{
-    process_cancel_quote_ix, process_open_ix, process_quote_ix, process_settle_ix,
+    process_cancel_quote_ix, process_open_ix, process_option_cancel_ix, process_option_open_ix,
+    process_option_quote_ix, process_option_settle_ix, process_quote_ix, process_settle_ix,
+    process_veil_in_ix, process_veil_out_ix,
 };
 
 pub mod tag {
@@ -27,6 +29,12 @@ pub mod tag {
     pub const OPEN: u8 = 3;
     pub const SETTLE: u8 = 4;
     pub const CANCEL_QUOTE: u8 = 5;
+    pub const OPTION_QUOTE: u8 = 6;
+    pub const OPTION_OPEN: u8 = 7;
+    pub const OPTION_SETTLE: u8 = 8;
+    pub const OPTION_CANCEL: u8 = 9;
+    pub const VEIL_IN: u8 = 10;
+    pub const VEIL_OUT: u8 = 11;
 }
 
 pub const MAKER_AUTHORITY_PDA_SEED: &[u8] = b"maker_authority";
@@ -47,6 +55,23 @@ pub const OPEN_BLINDING_DOMAIN: u32 = u32::from_be_bytes(*b"DPOP");
 /// `Poseidon(DPST, position_utxo_blinding)`: either party derives its payout
 /// from the position opening and the first nullifier.
 pub const SETTLE_BLINDING_DOMAIN: u32 = u32::from_be_bytes(*b"DPST");
+
+/// Domain of the option open transaction's blinding seed,
+/// `Poseidon(DOOP, quote_utxo_blinding)`, as [`OPEN_BLINDING_DOMAIN`] is for
+/// a perp.
+pub const OPTION_OPEN_BLINDING_DOMAIN: u32 = u32::from_be_bytes(*b"DOOP");
+
+/// Domain of the option settle transaction's blinding seed,
+/// `Poseidon(DOST, option_utxo_blinding)`, as [`SETTLE_BLINDING_DOMAIN`] is
+/// for a perp.
+pub const OPTION_SETTLE_BLINDING_DOMAIN: u32 = u32::from_be_bytes(*b"DOST");
+
+/// The seed of the veil PDA, `[VEIL_PDA_SEED]`: the one owner of every veil
+/// note. Only the program signs for it, and only in `veil_out`.
+pub const VEIL_PDA_SEED: &[u8] = b"veil";
+
+/// Domain of a veil note's claim, `Poseidon(VEIL, secret)`.
+pub const VEIL_CLAIM_DOMAIN: u32 = u32::from_be_bytes(*b"VEIL");
 
 #[cfg(all(feature = "bpf-entrypoint", not(feature = "build-circuits"), not(xark)))]
 mod entrypoint {
@@ -74,6 +99,12 @@ pub fn process_instruction(
         tag::OPEN => process_open_ix(accounts, ix_data),
         tag::SETTLE => process_settle_ix(accounts, ix_data),
         tag::CANCEL_QUOTE => process_cancel_quote_ix(accounts, ix_data),
+        tag::OPTION_QUOTE => process_option_quote_ix(accounts, ix_data),
+        tag::OPTION_OPEN => process_option_open_ix(accounts, ix_data),
+        tag::OPTION_SETTLE => process_option_settle_ix(accounts, ix_data),
+        tag::OPTION_CANCEL => process_option_cancel_ix(accounts, ix_data),
+        tag::VEIL_IN => process_veil_in_ix(accounts, ix_data),
+        tag::VEIL_OUT => process_veil_out_ix(accounts, ix_data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }

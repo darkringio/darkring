@@ -33,6 +33,10 @@ pub enum PerpError {
     StaleOraclePrice = 9013,
     #[error("oracle price is not positive")]
     InvalidOraclePrice = 9014,
+    #[error("authority bump does not derive the veil PDA")]
+    InvalidVeilBump = 9015,
+    #[error("veil-authority account is missing from the transact account list")]
+    MissingVeilAuthority = 9016,
 }
 
 impl From<PerpError> for ProgramError {

@@ -17,8 +17,9 @@ pub use perps_program::{
         oracle::{encode_price_update, OraclePrice, MAX_PRICE_AGE_SECS, ORACLE_PROGRAM_ID},
         quote::{QuoteIxData, QuoteMarkerData, QuoteProof},
         settle::{SettleIxData, SettleProof},
+        veil::{VeilInIxData, VeilOutIxData, VeilProof},
     },
-    maker_authority_seeds, tag, MAKER_AUTHORITY_PDA_SEED,
+    maker_authority_seeds, tag, MAKER_AUTHORITY_PDA_SEED, VEIL_PDA_SEED,
 };
 use solana_address::Address;
 use spr_program::ProgramOwner;
@@ -40,6 +41,22 @@ pub fn maker_authority_bump(maker: &Address) -> u8 {
 /// key. Its view tag finds the maker's quote and position UTXOs.
 pub fn maker_authority(maker: &Address) -> ProgramOwner {
     ProgramOwner::find(&maker_authority_seeds(maker.as_array()), &perps_program::ID)
+}
+
+/// The veil PDA, `[VEIL_PDA_SEED]`: the one owner of every veil note.
+pub fn veil_pda() -> Address {
+    *veil_authority().pda()
+}
+
+/// The canonical bump of the veil PDA, which the instruction builders pass.
+pub fn veil_bump() -> u8 {
+    Address::find_program_address(&[VEIL_PDA_SEED], &perps_program::ID).1
+}
+
+/// The veil PDA as a UTXO owner, under the zero nullifier key. Its view tag
+/// finds every veil note.
+pub fn veil_authority() -> ProgramOwner {
+    ProgramOwner::find(&[VEIL_PDA_SEED], &perps_program::ID)
 }
 
 pub(crate) fn err(e: impl core::fmt::Debug) -> anyhow::Error {

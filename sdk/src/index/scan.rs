@@ -56,6 +56,23 @@ pub(crate) fn decode_quote(
     asset: spr_transaction::Mint,
     maker: &Address,
 ) -> Result<DataUtxo<circuits::QuoteTerms>> {
+    decode_owned(tx, slot, slot_index, plaintext, asset, maker)
+}
+
+/// [`decode_quote`] for any state of a UTXO owned by `maker`'s authority: a
+/// perp quote or an option quote.
+pub(crate) fn decode_owned<T>(
+    tx: &ShieldedTransaction,
+    slot: &OutputSlot,
+    slot_index: u32,
+    plaintext: ConfidentialOutputPlaintext,
+    asset: spr_transaction::Mint,
+    maker: &Address,
+) -> Result<DataUtxo<T>>
+where
+    DataUtxo<T>: TryFrom<WalletUtxo>,
+    <DataUtxo<T> as TryFrom<WalletUtxo>>::Error: core::fmt::Debug,
+{
     let utxo = WalletUtxo {
         utxo: Utxo {
             owner: maker_authority(maker).public_key(),

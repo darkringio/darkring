@@ -31,5 +31,9 @@ name = "perps"
 path = "tests/perps.rs"
 
 [[test]]
+name = "dated"
+path = "tests/dated.rs"
+
+[[test]]
 name = "devnet"
 path = "tests/devnet.rs"
